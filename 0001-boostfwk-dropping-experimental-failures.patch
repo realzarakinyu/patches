@@ -1,0 +1,70 @@
+From cb4e66cb553dce34784f43e653e81e4d6c124ef5 Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Sun, 5 Oct 2025 21:26:48 +0800
+Subject: [PATCH] [boostfwk] dropping experimental failures
+
+exclusive surfaceflinger/display cpuset - failure
+ux critical threads scheduling - failure
+
+Change-Id: Ic6fc36aeea42775a2173274077a97691807fed21
+---
+ .../core/java/com/android/server/am/BoostAdjuster.java   | 8 ++++----
+ .../core/java/com/android/server/am/TaskProfiler.java    | 9 ---------
+ 2 files changed, 4 insertions(+), 13 deletions(-)
+
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+index ee1771c5cc46..b1ac9f0c26dd 100644
+--- a/services/core/java/com/android/server/am/BoostAdjuster.java
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -322,8 +322,8 @@ public class BoostAdjuster implements IBoostAdjuster {
+             int threadPriority = Process.getThreadPriority(pid);
+ 
+             if (duration > 0) {
+-                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
+-                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
++                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 1);
++                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 10);
+                 boostUtil(pid, 1);
+                 boostAnimRes(true);
+                 Message m = mHandler.obtainMessage(pid);
+@@ -334,8 +334,8 @@ public class BoostAdjuster implements IBoostAdjuster {
+             }
+ 
+             if (duration == 0) {
+-                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
+-                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
++                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 1);
++                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 10);
+                 boostUtil(pid, 1);
+                 boostAnimRes(true);
+                 return;
+diff --git a/services/core/java/com/android/server/am/TaskProfiler.java b/services/core/java/com/android/server/am/TaskProfiler.java
+index e1a9139b414c..8737b2a49ddc 100644
+--- a/services/core/java/com/android/server/am/TaskProfiler.java
++++ b/services/core/java/com/android/server/am/TaskProfiler.java
+@@ -32,7 +32,6 @@ public class TaskProfiler {
+     private static final boolean DEBUG = false;
+ 
+     private static final int UX_KERNEL   = Process.THREAD_GROUP_BACKGROUND;
+-    private static final int UX_LATENCY = AxUtils.THREAD_GROUP_AX_DISPLAY; 
+ 
+     public TaskProfiler() {
+     }
+@@ -49,14 +48,6 @@ public class TaskProfiler {
+             uxThreads.addAll(findByPrefix(processMap, "f2fs_gc", UX_KERNEL));
+             uxThreads.addAll(findByPrefix(processMap, "eh_comp_thread", UX_KERNEL));
+ 
+-            uxThreads.addAll(findMatchingTidsInProcess(ActivityManagerService.MY_PID,
+-                    new String[]{"InputReader", "InputDispatcher"}, UX_LATENCY));
+-
+-            setUxThread(AnimationThread.get().getThreadId(), UX_LATENCY);
+-            setUxThread(SurfaceAnimationThread.get().getThreadId(), UX_LATENCY);
+-            setUxThread(DisplayThread.get().getThreadId(), UX_LATENCY);
+-            setUxThread(UiThread.get().getThreadId(), UX_LATENCY);
+-
+             if (DEBUG) Slog.i(TAG, "Applied task profiles to " + uxThreads.size() + " tids. processMap:\n" + dumpProcessMap(processMap));
+         } catch (Exception e) {
+             Slog.w(TAG, "initTaskProfiles failed: " + e);
+-- 
+2.51.2
+

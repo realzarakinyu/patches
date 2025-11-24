@@ -1,0 +1,148 @@
+From 0a10ca9f2347f1111a09c0f81a0793a399c35770 Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Tue, 28 Oct 2025 11:20:50 +0800
+Subject: [PATCH] [boostfwk] removing display cpu leftovers | adding audio cpu
+ data
+
+Change-Id: I2ae83bfb3520d6853d7b09bd0697cf6801ca70e1
+Signed-off-by: rmp22 <195054967+rmp22@users.noreply.github.com>
+---
+ .../com/android/server/am/BoostAdjuster.java    |  9 ---------
+ .../java/com/android/server/am/DeviceData.java  | 17 ++++++-----------
+ 2 files changed, 6 insertions(+), 20 deletions(-)
+
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+index d2d689acb461..1728fa797043 100644
+--- a/services/core/java/com/android/server/am/BoostAdjuster.java
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -72,8 +72,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+     private static final HashMap<String, String> sConfig = new HashMap<>();
+     private static final HashMap<String, String> sBoosts = new HashMap<>();
+     private static final HashMap<String, String> sMinFreqs = new HashMap<>();
+-    private static final HashMap<String, String> sSfBoostEnabled = new HashMap<>();
+-    private static final HashMap<String, String> sSfBoostDisabled = new HashMap<>();
+     private static final HashMap<String, String> sRestrictBackgroundOn = new HashMap<>();
+     private static final HashMap<String, String> sRestrictBackgroundOff = new HashMap<>();
+     private static final HashMap<String, String> sDefaultsCpu = new HashMap<>();
+@@ -177,12 +175,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+         sMinFreqs.put(data.bMin, data.uBMin);
+         sMinFreqs.put(data.pMin, data.uPMin);
+ 
+-        sSfBoostEnabled.clear();
+-        sSfBoostEnabled.put(CPU_DISPLAY, data.allCores);
+-
+-        sSfBoostDisabled.clear();
+-        sSfBoostDisabled.put(CPU_DISPLAY, data.displayCpus);
+-
+         sRestrictBackgroundOn.clear();
+         sRestrictBackgroundOn.put(CPU_BG, data.bgLimit);
+         sRestrictBackgroundOn.put(CPU_NT_FG, data.bgLimit);
+@@ -616,7 +608,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+         } finally {
+             p.recycle();
+         }
+-        write(enabled ? sSfBoostEnabled : sSfBoostDisabled);
+     }
+ 
+     public void write(HashMap<String, String> values) {
+diff --git a/services/core/java/com/android/server/am/DeviceData.java b/services/core/java/com/android/server/am/DeviceData.java
+index 940f80e31589..c9ad59e1b167 100644
+--- a/services/core/java/com/android/server/am/DeviceData.java
++++ b/services/core/java/com/android/server/am/DeviceData.java
+@@ -89,7 +89,7 @@ public final class DeviceData {
+                 s(fBoost), s(fBoostB), s(fBoostP),
+                 s(uSMin), s(uBMin), s(uPMin),
+                 s(uSMax), s(uBMax), s(uPMax),
+-                cData.bgCpus, cData.fgCpus, cData.displayCpus,
++                cData.bgCpus, cData.fgCpus,
+                 cData.bgLimit, cData.uiLimit,
+                 gGpuBoost, sGpuBoost
+         );
+@@ -128,7 +128,6 @@ public final class DeviceData {
+ 
+         public final String bgCpus;
+         public final String fgCpus;
+-        public final String displayCpus;
+ 
+         public final String bgLimit;
+         public final String uiLimit;
+@@ -165,7 +164,6 @@ public final class DeviceData {
+                 String uPMax,
+                 String bgCpus,
+                 String fgCpus,
+-                String displayCpus,
+                 String bgLimit,
+                 String uiLimit,
+                 int gGpuBoost,
+@@ -202,7 +200,6 @@ public final class DeviceData {
+ 
+             this.bgCpus = bgCpus;
+             this.fgCpus = fgCpus;
+-            this.displayCpus = displayCpus;
+ 
+             this.bgLimit = bgLimit;
+             this.uiLimit = uiLimit;
+@@ -227,7 +224,6 @@ public final class DeviceData {
+ 
+         public final String bgCpus;
+         public final String fgCpus;
+-        public final String displayCpus;
+         public final String bgLimit;
+         public final String uiLimit;
+         
+@@ -238,7 +234,7 @@ public final class DeviceData {
+                 String sMin, String bMin, String pMin,
+                 String sMax, String bMax, String pMax,
+                 String allCores,
+-                String bgCpus, String fgCpus, String displayCpus,
++                String bgCpus, String fgCpus,
+                 String bgLimit, String uiLimit, 
+                 boolean hasPrime
+         ) {
+@@ -255,7 +251,6 @@ public final class DeviceData {
+             this.allCores = allCores;
+             this.bgCpus = bgCpus;
+             this.fgCpus = fgCpus;
+-            this.displayCpus = displayCpus;
+             this.bgLimit = bgLimit;
+             this.uiLimit = uiLimit;
+             this.hasPrime = hasPrime;
+@@ -338,7 +333,7 @@ public final class DeviceData {
+ 
+         String bgCpus = rangeTo(sCores, 3);
+         String fgCpus = allCores;
+-        String displayCpus = joinRanges(smallR, rangeTo(bCores, 2));
++        String audioCpus = joinRanges(smallR, rangeTo(bCores, 2));
+         String boostCpus = joinRanges(bigR, primeR);
+ 
+         String bgLimit = rangeTo(sCores, 2);
+@@ -350,7 +345,7 @@ public final class DeviceData {
+         propSet("cpu_all", allCores);
+         propSet("cpu_bg", bgCpus);
+         propSet("cpu_fg", fgCpus);
+-        propSet("cpu_display", displayCpus);
++        propSet("cpu_audio", audioCpus);
+         propSet("cpu_limit_bg", bgLimit);
+         propSet("cpu_limit_ui", uiLimit);
+         
+@@ -364,7 +359,7 @@ public final class DeviceData {
+                 " allCores=" + allCores +
+                 " bgCpus=" + bgCpus +
+                 " fgCpus=" + fgCpus +
+-                " displayCpus=" + displayCpus +
++                " audioCpus=" + audioCpus +
+                 " cpu_limit_bg=" + bgLimit +
+                 " cpu_limit_ui=" + uiLimit +
+                 " hasPrime=" + hasPrime);
+@@ -374,7 +369,7 @@ public final class DeviceData {
+                 sMin, bMin, pMin,
+                 sMax, bMax, pMax,
+                 allCores,
+-                bgCpus, fgCpus, displayCpus,
++                bgCpus, fgCpus,
+                 bgLimit, uiLimit, 
+                 hasPrime
+         );
+-- 
+2.51.2
+

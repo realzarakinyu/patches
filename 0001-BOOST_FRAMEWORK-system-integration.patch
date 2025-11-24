@@ -1,0 +1,3109 @@
+From b51106f0d8cc3610a62715476029e9d1f03b92a1 Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Thu, 11 Sep 2025 21:25:48 +0800
+Subject: [PATCH] [BOOST_FRAMEWORK] system integration
+
+Change-Id: Ic83259a257405a8666960dd873c06257e9d79025
+Signed-off-by: rmp22 <195054967+rmp22@users.noreply.github.com>
+---
+ core/java/android/app/IActivityManager.aidl   |   7 +-
+ .../android/internal/util/BoostHelper.java    |  74 +++
+ core/jni/android_util_Process.cpp             |   5 +
+ .../keyguard/KeyguardUpdateMonitor.java       |   1 +
+ .../systemui/biometrics/AuthRippleView.kt     |   3 +
+ .../systemui/biometrics/UdfpsController.java  |   2 +
+ .../keyguard/KeyguardViewMediator.java        |   3 +
+ .../qs/composefragment/QSFragmentCompose.kt   |  22 -
+ .../NotificationPanelViewController.java      |   6 +
+ .../shade/QuickSettingsControllerImpl.java    |   2 +
+ .../StatusBarStateControllerImpl.java         |  17 +
+ .../stack/NotificationStackScrollLayout.java  |   3 +
+ .../UnlockedScreenOffAnimationController.kt   |   4 +
+ .../systemui/util/NTBoosterController.kt      | 177 +++++++
+ .../systemui/util/NTCpuBindController.java    | 274 -----------
+ .../systemui/util/NTCpuBindController.kt      | 168 +++++++
+ .../systemui/util/TaskWorkerManager.kt        |  51 ++
+ .../server/am/ActivityManagerService.java     | 277 ++---------
+ .../com/android/server/am/BoostAdjuster.java  | 448 ++++++++++++++++++
+ .../com/android/server/am/BoostConfig.java    | 334 +++++++++++++
+ .../com/android/server/am/MemoryManager.java  | 107 +++++
+ .../com/android/server/am/OomAdjuster.java    |  24 +-
+ .../com/android/server/am/ProcessList.java    |  23 +
+ .../com/android/server/am/ProcessManager.java | 101 ++++
+ .../com/android/server/am/ProcessRecord.java  |   5 +
+ .../com/android/server/am/TaskProfiler.java   |  77 +++
+ .../android/server/audio/AudioService.java    |   4 +
+ .../display/mode/DisplayModeDirector.java     |   7 +
+ .../com/android/server/wm/ActivityRecord.java |   1 +
+ .../server/wm/ActivityTaskSupervisor.java     |  11 +
+ .../com/android/server/wm/DisplayContent.java |  18 +-
+ .../com/android/server/wm/DisplayPolicy.java  |  21 +-
+ .../server/wm/PointerEventDispatcher.java     |   2 +
+ .../server/wm/RootWindowContainer.java        |   1 +
+ .../SystemGesturesPointerEventListener.java   |  35 +-
+ .../com/android/server/wm/TaskFragment.java   |  11 +-
+ 36 files changed, 1757 insertions(+), 569 deletions(-)
+ create mode 100644 core/java/com/android/internal/util/BoostHelper.java
+ create mode 100644 packages/SystemUI/src/com/android/systemui/util/NTBoosterController.kt
+ delete mode 100644 packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.java
+ create mode 100644 packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
+ create mode 100644 packages/SystemUI/src/com/android/systemui/util/TaskWorkerManager.kt
+ create mode 100644 services/core/java/com/android/server/am/BoostAdjuster.java
+ create mode 100644 services/core/java/com/android/server/am/BoostConfig.java
+ create mode 100644 services/core/java/com/android/server/am/MemoryManager.java
+ create mode 100644 services/core/java/com/android/server/am/ProcessManager.java
+ create mode 100644 services/core/java/com/android/server/am/TaskProfiler.java
+
+diff --git a/core/java/android/app/IActivityManager.aidl b/core/java/android/app/IActivityManager.aidl
+index 15fe78dc148d..9044508d91c9 100644
+--- a/core/java/android/app/IActivityManager.aidl
++++ b/core/java/android/app/IActivityManager.aidl
+@@ -1044,11 +1044,12 @@ interface IActivityManager {
+      */
+     void releaseMemory(int minAdj, int maxKillCount, boolean includeUIProcesses, boolean skipCamera);
+     void executeAdjustCpusetCpus(String path, String cpuset);
+-    void adjustCpusetCpus(String path, String cpuset, long durationMillis);
++    void adjustCpusetCpus(String cgroup, long durationMillis);
+     void animationBoost(int pid, boolean enabled);
+     void setThreadAffinity(int pid, int affinity);
+-    void setPerformanceMode(boolean enabled);
+-    boolean isBoostingAnimation();
++    void setPerformanceMode(boolean enabled, String reason);
++    void boostHint(String reason, long duration);
++    void inputBoost(long duration);
+ 
+     /**
+      * Force full screen
+diff --git a/core/java/com/android/internal/util/BoostHelper.java b/core/java/com/android/internal/util/BoostHelper.java
+new file mode 100644
+index 000000000000..be5b5c51bc6f
+--- /dev/null
++++ b/core/java/com/android/internal/util/BoostHelper.java
+@@ -0,0 +1,74 @@
++package com.android.internal.util;
++
++import android.app.ActivityManager;
++import android.os.Handler;
++import android.os.HandlerThread;
++import android.util.Log;
++
++public class BoostHelper {
++
++    private static final String TAG = "BoostHelper";
++    private static final boolean DEBUG = false;
++
++    public static void setPerformanceMode(boolean enabled, String reason) {
++        try {
++            ActivityManager.getService().setPerformanceMode(enabled, reason);
++        } catch (Exception e) {
++            logException("setPerformanceMode", e);
++        }
++    }
++
++    public static void boostHint(String reason, long duration) {
++        try {
++            ActivityManager.getService().boostHint(reason, duration);
++        } catch (Exception e) {
++            logException("setPerformanceMode", e);
++        }
++    }
++
++    public static void executeAdjustCpusetCpus(String path, String cpus) {
++        try {
++            ActivityManager.getService().executeAdjustCpusetCpus(path, cpus);
++        } catch (Exception e) {
++            logException("executeAdjustCpusetCpus", e);
++        }
++    }
++
++    public static void adjustCpusetCpus(String cgroup, long durationMillis) {
++        try {
++            ActivityManager.getService().adjustCpusetCpus(cgroup, durationMillis);
++        } catch (Exception e) {
++            logException("adjustCpusetCpus", e);
++        }
++    }
++
++    public static void animationBoost(int pid, boolean enabled) {
++        try {
++            ActivityManager.getService().animationBoost(pid, enabled);
++        } catch (Exception e) {
++            logException("animationBoost", e);
++        }
++    }
++
++    public static void setThreadAffinity(int pid, int affinity) {
++        try {
++            ActivityManager.getService().setThreadAffinity(pid, affinity);
++        } catch (Exception e) {
++            logException("setThreadAffinity", e);
++        }
++    }
++
++    public static void inputBoost(long durationMillis) {
++        try {
++            ActivityManager.getService().inputBoost(durationMillis);
++        } catch (Exception e) {
++            logException("inputBoost", e);
++        }
++    }
++
++    private static void logException(String method, Exception e) {
++        if (DEBUG) {
++            Log.w(TAG, method + " failed", e);
++        }
++    }
++}
+diff --git a/core/jni/android_util_Process.cpp b/core/jni/android_util_Process.cpp
+index 662112834d08..801c840f0e60 100644
+--- a/core/jni/android_util_Process.cpp
++++ b/core/jni/android_util_Process.cpp
+@@ -406,6 +406,11 @@ static void get_cpuset_cores_for_policy(SchedPolicy policy, cpu_set_t *cpu_set)
+                 return;
+             }
+             break;
++        case SP_DISPLAY:
++            if (!CgroupGetAttributePath("DisplayCPUs", &filename)) {
++                return;
++            }
++            break;
+         case SP_FOREGROUND_WINDOW:
+             if (!CgroupGetAttributePath("HighCapacityWICPUs", &filename)) {
+                 return;
+diff --git a/packages/SystemUI/src/com/android/keyguard/KeyguardUpdateMonitor.java b/packages/SystemUI/src/com/android/keyguard/KeyguardUpdateMonitor.java
+index 63eea1e45c79..39c26ffc2fb8 100644
+--- a/packages/SystemUI/src/com/android/keyguard/KeyguardUpdateMonitor.java
++++ b/packages/SystemUI/src/com/android/keyguard/KeyguardUpdateMonitor.java
+@@ -1906,6 +1906,7 @@ public class KeyguardUpdateMonitor implements TrustManager.TrustListener, CoreSt
+                             ActiveUnlockConfig.ActiveUnlockRequestOrigin.BIOMETRIC_FAIL,
+                             "fingerprintFailure");
+                     handleFingerprintAuthFailed();
++                    com.android.systemui.util.NTBoosterController.get().releaseUnlockAnimationBoost();
+                 }
+ 
+                 @Override
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/AuthRippleView.kt b/packages/SystemUI/src/com/android/systemui/biometrics/AuthRippleView.kt
+index 5b665ed550e1..a4876eff365d 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/AuthRippleView.kt
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/AuthRippleView.kt
+@@ -31,6 +31,7 @@ import com.android.internal.graphics.ColorUtils
+ import com.android.app.animation.Interpolators
+ import com.android.settingslib.Utils
+ import com.android.systemui.surfaceeffects.ripple.RippleShader
++import com.android.systemui.util.NTBoosterController
+ 
+ private const val RIPPLE_SPARKLE_STRENGTH: Float = 0.3f
+ 
+@@ -281,6 +282,7 @@ class AuthRippleView(context: Context?, attrs: AttributeSet?) : View(context, at
+                 override fun onAnimationStart(animation: Animator) {
+                     drawRipple = true
+                     visibility = VISIBLE
++                    NTBoosterController.get().acquireRippleAnimationBoost()
+                 }
+ 
+                 override fun onAnimationEnd(animation: Animator) {
+@@ -288,6 +290,7 @@ class AuthRippleView(context: Context?, attrs: AttributeSet?) : View(context, at
+                     drawRipple = false
+                     visibility = GONE
+                     unlockedRippleAnimator = null
++                    NTBoosterController.get().releaseRippleAnimationBoost()
+                 }
+             })
+         }
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java b/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
+index 2ab2ed8ac95f..a5beb8dbffd5 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
+@@ -1106,6 +1106,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+             }
+             mUdfpsAnimProxy.show();
+         }
++        
++        com.android.systemui.util.NTBoosterController.get().acquireUnlockAnimationBoost();
+     }
+ 
+     private void onFingerUp(long requestId, @NonNull View view) {
+diff --git a/packages/SystemUI/src/com/android/systemui/keyguard/KeyguardViewMediator.java b/packages/SystemUI/src/com/android/systemui/keyguard/KeyguardViewMediator.java
+index 5da9fa355a60..f15d009ca79c 100644
+--- a/packages/SystemUI/src/com/android/systemui/keyguard/KeyguardViewMediator.java
++++ b/packages/SystemUI/src/com/android/systemui/keyguard/KeyguardViewMediator.java
+@@ -180,6 +180,7 @@ import com.android.systemui.statusbar.policy.UserSwitcherController;
+ import com.android.systemui.user.domain.interactor.SelectedUserInteractor;
+ import com.android.systemui.util.DeviceConfigProxy;
+ import com.android.systemui.util.kotlin.JavaAdapter;
++import com.android.systemui.util.NTBoosterController;
+ import com.android.systemui.util.settings.SecureSettings;
+ import com.android.systemui.util.settings.SystemSettings;
+ import com.android.systemui.util.time.SystemClock;
+@@ -892,6 +893,7 @@ public class KeyguardViewMediator implements CoreStartable,
+             if (targetUserId != mSelectedUserInteractor.getSelectedUserId()) {
+                 return;
+             }
++            NTBoosterController.get().acquireKeyguardGoneAnimationBoost();
+             Log.d(TAG, "keyguardDone");
+             tryKeyguardDone();
+         }
+@@ -954,6 +956,7 @@ public class KeyguardViewMediator implements CoreStartable,
+                 }
+             }
+             Trace.endSection();
++            NTBoosterController.get().releaseKeyguardGoneAnimationBoost();
+         }
+ 
+         @Override
+diff --git a/packages/SystemUI/src/com/android/systemui/qs/composefragment/QSFragmentCompose.kt b/packages/SystemUI/src/com/android/systemui/qs/composefragment/QSFragmentCompose.kt
+index 8e9efcf170dc..b14b5c4c5050 100644
+--- a/packages/SystemUI/src/com/android/systemui/qs/composefragment/QSFragmentCompose.kt
++++ b/packages/SystemUI/src/com/android/systemui/qs/composefragment/QSFragmentCompose.kt
+@@ -127,7 +127,6 @@ import com.android.systemui.lifecycle.setSnapshotBinding
+ import com.android.systemui.media.controls.ui.view.MediaHost
+ import com.android.systemui.plugins.qs.QS
+ import com.android.systemui.plugins.qs.QSContainerController
+-import com.android.systemui.qs.composefragment.Booster
+ import com.android.systemui.qs.composefragment.SceneKeys.QuickQuickSettings
+ import com.android.systemui.qs.composefragment.SceneKeys.QuickSettings
+ import com.android.systemui.qs.composefragment.SceneKeys.debugName
+@@ -148,7 +147,6 @@ import com.android.systemui.qs.ui.composable.QuickSettingsShade.systemGestureExc
+ import com.android.systemui.qs.ui.composable.QuickSettingsTheme
+ import com.android.systemui.res.R
+ import com.android.systemui.util.LifecycleFragment
+-import com.android.systemui.util.NTCpuBindController
+ import com.android.systemui.util.animation.UniqueObjectHostView
+ import com.android.systemui.util.asIndenting
+ import com.android.systemui.util.printSection
+@@ -474,7 +472,6 @@ constructor(
+         viewModel.panelExpansionFraction = panelExpansionFraction
+         viewModel.squishinessFraction = squishinessFraction
+         viewModel.proposedTranslation = headerTranslation
+-        Booster.setExpansionEx(panelExpansionFraction, viewModel.isKeyguardState)
+     }
+ 
+     override fun setHeaderListening(listening: Boolean) {
+@@ -1495,22 +1492,3 @@ private fun AlwaysDarkMode(content: @Composable () -> Unit) {
+         }
+     }
+ }
+-
+-object Booster {
+-    private val TYPE_EXPAND = NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION
+-    private var enableBoost: Boolean? = null
+-
+-    fun boost(type: Int, enabled: Boolean) {
+-        val cpuBindController = NTCpuBindController.INSTANCE()
+-        cpuBindController.setLimitOtherProcessCpu(enabled)
+-        cpuBindController.setLimitForegroundAppCpu(enabled)
+-        cpuBindController.animationBoost(type, enabled)
+-    }
+-
+-    fun setExpansionEx(expansion: Float, onKeyguard: Boolean) {
+-        val boost = expansion > 0f && !onKeyguard
+-        if (enableBoost == boost) return
+-        boost(TYPE_EXPAND, boost)
+-        enableBoost = boost
+-    }
+-}
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/NotificationPanelViewController.java b/packages/SystemUI/src/com/android/systemui/shade/NotificationPanelViewController.java
+index edc0d54ffcb5..f333f08259f2 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/NotificationPanelViewController.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/NotificationPanelViewController.java
+@@ -201,6 +201,7 @@ import com.android.systemui.statusbar.policy.KeyguardStateController;
+ import com.android.systemui.statusbar.policy.SplitShadeStateController;
+ import com.android.systemui.unfold.SysUIUnfoldComponent;
+ import com.android.systemui.util.Compile;
++import com.android.systemui.util.NTBoosterController;
+ import com.android.systemui.util.ScrimUtils;
+ import com.android.systemui.util.Utils;
+ import com.android.systemui.util.time.SystemClock;
+@@ -1490,6 +1491,7 @@ public final class NotificationPanelViewController implements
+             @Override
+             public void onAnimationCancel(Animator animation) {
+                 mCancelled = true;
++                NTBoosterController.get().releaseNPVFlingBoost();
+             }
+ 
+             @Override
+@@ -1501,6 +1503,7 @@ public final class NotificationPanelViewController implements
+                 } else {
+                     onFlingEnd(mCancelled);
+                 }
++                NTBoosterController.get().releaseNPVFlingBoost();
+             }
+         });
+         if (!mScrimController.isScreenOn()) {
+@@ -1511,6 +1514,7 @@ public final class NotificationPanelViewController implements
+         }
+         setAnimator(animator);
+         animator.start();
++        NTBoosterController.get().acquireNPVFlingBoost();
+     }
+ 
+     private final boolean shouldIgnoreStartFlingAnimavor(ValueAnimator newAnimator, ValueAnimator oldAnimator, float vel, boolean expand) {
+@@ -2141,6 +2145,7 @@ public final class NotificationPanelViewController implements
+     }
+ 
+     private void onTrackingStarted() {
++        NTBoosterController.get().acquireNPVTrackingBoost();
+         endClosing();
+         mShadeRepository.setLegacyShadeTracking(true);
+         if (mTrackingStartedListener != null) {
+@@ -2170,6 +2175,7 @@ public final class NotificationPanelViewController implements
+         // If we unlocked from a swipe, the user's finger might still be down after the
+         // unlock animation ends. We need to wait until ACTION_UP to enable blurs again.
+         mDepthController.setBlursDisabledForUnlock(false);
++        NTBoosterController.get().releaseNPVTrackingBoost();
+     }
+ 
+     private void updateMaxHeadsUpTranslation() {
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java b/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
+index be20fd1d4d50..4565e0e92484 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
+@@ -111,6 +111,7 @@ import com.android.systemui.statusbar.policy.SplitShadeStateController;
+ import com.android.systemui.user.domain.interactor.SelectedUserInteractor;
+ import com.android.systemui.util.LargeScreenUtils;
+ import com.android.systemui.util.NTAppLockerHelper;
++import com.android.systemui.util.NTBoosterController;
+ import com.android.systemui.util.kotlin.JavaAdapter;
+ import com.android.systemui.utils.windowmanager.WindowManagerProvider;
+ 
+@@ -1101,6 +1102,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
+                 getHeaderTranslation(),
+                 squishiness
+         );
++        NTBoosterController.get().setExpansionEx(adjustedExpansionFraction);
+         if (QuickStepContract.ALLOW_BACK_GESTURE_IN_SHADE
+                 && mPanelViewControllerLazy.get().mAnimateBack) {
+             mPanelViewControllerLazy.get().adjustBackAnimationScale(adjustedExpansionFraction);
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
+index 4be04f299ba8..b6a45078b3a8 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
+@@ -19,6 +19,8 @@ package com.android.systemui.statusbar;
+ import static com.android.systemui.keyguard.shared.model.KeyguardState.GONE;
+ import static com.android.systemui.util.kotlin.JavaAdapterKt.combineFlows;
+ 
++import android.animation.Animator;
++import android.animation.AnimatorListenerAdapter;
+ import android.animation.ObjectAnimator;
+ import android.animation.ValueAnimator;
+ import android.os.SystemProperties;
+@@ -60,6 +62,7 @@ import com.android.systemui.statusbar.notification.stack.StackStateAnimator;
+ import com.android.systemui.statusbar.policy.CallbackController;
+ import com.android.systemui.util.Compile;
+ import com.android.systemui.util.kotlin.JavaAdapter;
++import com.android.systemui.util.NTBoosterController;
+ import com.android.systemui.util.ScrimUtils;
+ 
+ import dagger.Lazy;
+@@ -461,6 +464,20 @@ public class StatusBarStateControllerImpl implements
+                 this, SET_DARK_AMOUNT_PROPERTY, mDozeAmountTarget);
+         darkAnimator.setInterpolator(Interpolators.LINEAR);
+         darkAnimator.setDuration(StackStateAnimator.ANIMATION_DURATION_WAKEUP);
++        darkAnimator.addListener(new AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationCancel(Animator animation) {
++                NTBoosterController.get().releaseDozeAnimationBoost();
++            }
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                NTBoosterController.get().releaseDozeAnimationBoost();
++            }
++            @Override
++            public void onAnimationStart(Animator animation) {
++                NTBoosterController.get().acquireDozeAnimationBoost();
++            }
++        });
+         darkAnimator.start();
+         return darkAnimator;
+     }
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
+index cd4dcf5b72ba..f2cc3cf99e57 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
+@@ -146,6 +146,7 @@ import com.android.systemui.util.ColorUtilKt;
+ import com.android.systemui.util.DumpUtilsKt;
+ import com.android.systemui.util.ListenerSet;
+ import com.android.systemui.util.NTAppLockerHelper;
++import com.android.systemui.util.NTBoosterController;
+ import com.android.systemui.wallpapers.domain.interactor.WallpaperInteractor;
+ 
+ import com.google.errorprone.annotations.CompileTimeConstant;
+@@ -4425,11 +4426,13 @@ public class NotificationStackScrollLayout
+         mPanelTracking = true;
+         mAmbientState.setPanelTracking(true);
+         resetExposedMenuView(true /* animate */, true /* force */);
++        NTBoosterController.get().acquireNotificationStackBoost();
+     }
+ 
+     void onPanelTrackingStopped() {
+         mPanelTracking = false;
+         mAmbientState.setPanelTracking(false);
++        NTBoosterController.get().releaseNotificationStackBoost();
+     }
+ 
+     void resetScrollPosition() {
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/UnlockedScreenOffAnimationController.kt b/packages/SystemUI/src/com/android/systemui/statusbar/phone/UnlockedScreenOffAnimationController.kt
+index cdee021d8272..061f18bd5073 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/UnlockedScreenOffAnimationController.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/UnlockedScreenOffAnimationController.kt
+@@ -36,6 +36,7 @@ import com.android.systemui.statusbar.notification.PropertyAnimator
+ import com.android.systemui.statusbar.notification.stack.AnimationProperties
+ import com.android.systemui.statusbar.notification.stack.StackStateAnimator
+ import com.android.systemui.statusbar.policy.KeyguardStateController
++import com.android.systemui.util.NTBoosterController
+ import com.android.systemui.util.settings.GlobalSettings
+ import com.android.systemui.util.ScreenAnimationController
+ import dagger.Lazy
+@@ -123,12 +124,14 @@ constructor(
+                             lightRevealScrim.revealAmount = 1f
+                         }
+                         centralSurfaces.unlockedScreenOffAnimationCancel()
++                        NTBoosterController.get().releaseUnlockedScreenAnimationOffBoost()
+                     }
+ 
+                     override fun onAnimationEnd(animation: Animator) {
+                         lightRevealAnimationPlaying = false
+                         interactionJankMonitor.end(CUJ_SCREEN_OFF)
+                         val wakefulness = wakefulnessLifecycle.getWakefulness()
++                        NTBoosterController.get().releaseUnlockedScreenAnimationOffBoost()
+                         if (ScreenAnimationController.INSTANCE().shouldPlayAnimation() 
+                             && (wakefulness == WakefulnessLifecycle.WAKEFULNESS_WAKING 
+                                 || wakefulness == WakefulnessLifecycle.WAKEFULNESS_AWAKE)) {
+@@ -161,6 +164,7 @@ constructor(
+         namedRunnable("startLightReveal") {
+             lightRevealAnimationPlaying = true
+             lightRevealAnimator.start()
++            NTBoosterController.get().acquireUnlockedScreenAnimationOffBoost()
+         }
+ 
+     private val animatorDurationScaleObserver =
+diff --git a/packages/SystemUI/src/com/android/systemui/util/NTBoosterController.kt b/packages/SystemUI/src/com/android/systemui/util/NTBoosterController.kt
+new file mode 100644
+index 000000000000..d3baf15a4e25
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/util/NTBoosterController.kt
+@@ -0,0 +1,177 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.systemui.util
++
++class NTBoosterController private constructor() {
++
++    val controller: NTCpuBindController get() = NTCpuBindController.get()
++
++    private var expandFraction: Float = 0.0f
++    private var enableBoost: Boolean = false
++
++    fun acquireNotificationStackBoost() {
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_STACK_SCROLL_LAYOUT, false)
++    }
++
++    fun releaseNotificationStackBoost() {
++        releaseAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_STACK_SCROLL_LAYOUT, false)
++    }
++
++    fun acquireNPVExpandingBoost() {
++        controller.requestLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_NOTIFICATION_EXPAND)
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SWIPE_DOWN_NOTIFICATION_ANIMATION, true)
++        TaskWorkerManager.instance.taskWorker.postDelayed({
++            controller.setLimitForegroundAppCpu(true)
++        }, 50)
++    }
++
++    fun releaseNPVExpandingBoost() {
++        controller.requestUnLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_NOTIFICATION_EXPAND)
++        TaskWorkerManager.instance.taskWorker.postDelayed({
++            controller.setLimitForegroundAppCpu(false)
++        }, 50)
++        controller.animationBoostOff(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SWIPE_DOWN_NOTIFICATION_ANIMATION)
++    }
++
++    fun acquireNPVFlingBoost() {
++        controller.animationBoostOn(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_FLING_NOTIFICATION_PANEL_VIEW)
++    }
++
++    fun releaseNPVFlingBoost() {
++        controller.animationBoostOff(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_FLING_NOTIFICATION_PANEL_VIEW)
++    }
++
++    fun acquireNPVTrackingBoost() {
++        controller.animationBoostOn(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_PANEL_VIEW)
++    }
++
++    fun releaseNPVTrackingBoost() {
++        controller.animationBoostOff(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_PANEL_VIEW)
++    }
++
++    fun acquireSpeedUpNPVExpanded() {
++        controller.animationBoostOn(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_NOTIFICATION_PANEL_VIEW_EXPAND)
++    }
++
++    fun releaseSpeedUpNPVExpanded() {
++        controller.animationBoostOff(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_NOTIFICATION_PANEL_VIEW_EXPAND)
++    }
++
++    fun acquireExpansionAnimationBoost() {
++        controller.animationBoostOn(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION)
++    }
++
++    fun releaseExpansionAnimationBoost() {
++        controller.animationBoostOff(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION)
++    }
++
++    fun acquireUnlockAnimationBoost() {
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_UNLOCK, true)
++    }
++
++    fun releaseUnlockAnimationBoost() {
++        releaseAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_UNLOCK, true)
++    }
++
++    fun acquireUnlockedScreenAnimationOffBoost() {
++        val controller = controller
++        controller.requestLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_PLAY_SCREEN_OFF_ANIMATION)
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_LIGHT_REVEAL, true)
++    }
++
++    fun releaseUnlockedScreenAnimationOffBoost() {
++        val controller = controller
++        controller.requestUnLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_PLAY_SCREEN_OFF_ANIMATION)
++        releaseAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_LIGHT_REVEAL, true)
++    }
++
++    fun acquireDozeAnimationBoost() {
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_START_DOZE_ANIMATION, false)
++    }
++
++    fun releaseDozeAnimationBoost() {
++        releaseAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_START_DOZE_ANIMATION, false)
++    }
++
++    fun acquireRippleAnimationBoost() {
++        acquireAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_UNLOCK, false)
++    }
++
++    fun releaseRippleAnimationBoost() {
++        releaseAnimationBoost(NTCpuBindController.REQUEST_ANIMATION_BOOST_TYPE_UNLOCK, true)
++        controller.requestUnLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK)
++    }
++
++    fun setLimitOtherAppCpu(on: Boolean) {
++        if (on) {
++            controller.requestLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK)
++        } else {
++            controller.requestUnLimitOtherProcessCPU(NTCpuBindController.REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK)
++        }
++        controller.setLimitForegroundAppCpu(on)
++    }
++
++    fun acquireKeyguardGoneAnimationBoost() {
++        setLimitOtherAppCpu(true)
++    }
++
++    fun releaseKeyguardGoneAnimationBoost() {
++        setLimitOtherAppCpu(false)
++        controller.unbind()
++        TaskWorkerManager.instance.taskWorker.postDelayed({
++            releaseUnlockAnimationBoost()
++        }, 800L)
++    }
++
++    private fun acquireAnimationBoost(sceneId: Int, needBindBigCore: Boolean = false) {
++        if (needBindBigCore) controller.bindBigCore()
++        controller.animationBoostOn(sceneId)
++    }
++
++    private fun releaseAnimationBoost(sceneId: Int, needReleaseCore: Boolean = false) {
++        if (needReleaseCore) controller.unbind()
++        controller.animationBoostOff(sceneId)
++    }
++
++    fun setExpansionEx(expansion: Float) {
++        if (expansion != expandFraction) {
++            if (expansion == 1.0f || expansion == 0.0f) {
++                if (enableBoost) {
++                    releaseExpansionAnimationBoost()
++                }
++                enableBoost = false
++            } else {
++                if (!enableBoost) {
++                    acquireExpansionAnimationBoost()
++                }
++                enableBoost = true
++            }
++        }
++        expandFraction = expansion
++    }
++
++    companion object {
++        private var instance: NTBoosterController? = null
++
++        @JvmStatic
++        fun get(): NTBoosterController {
++            if (instance == null) {
++                instance = NTBoosterController()
++            }
++            return instance!!
++        }
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.java b/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.java
+deleted file mode 100644
+index 1bcc5d7d0aee..000000000000
+--- a/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.java
++++ /dev/null
+@@ -1,274 +0,0 @@
+-/*
+- * Copyright (C) 2025 AxionAOSP Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.android.systemui.util;
+-
+-import android.app.ActivityManager;
+-import android.os.Process;
+-import android.os.SystemProperties;
+-import android.util.Log;
+-
+-import java.util.Arrays;
+-import java.util.IntSummaryStatistics;
+-
+-public class NTCpuBindController {
+-
+-    private static final String TAG = "NTCpuBindController";
+-    
+-    private static final String CPUSET_PATH = "/dev/cpuset/";
+-    private static final String CAMERA_DAEMON_GROUP = CPUSET_PATH + "camera-daemon/cpus";
+-    private static final String TOP_APP_GROUP = CPUSET_PATH + "top-app/cpus";
+-    private static final String DEX2OAT_GROUP = CPUSET_PATH + "dex2oat/cpus";
+-    private static final String FG_GROUP = CPUSET_PATH + "foreground/cpus";
+-    private static final String FG_WINDOWN_GROUP = CPUSET_PATH + "foreground_window/cpus";
+-    private static final String RESTRICTED_GROUP = CPUSET_PATH + "restricted/cpus";
+-    private static final String SYS_BG_GROUP = CPUSET_PATH + "system-background/cpus";
+-    private static final String BG_GROUP = CPUSET_PATH + "background/cpus";
+-
+-    private static final String CPUS_PARAMS_BG_LIMIT = SystemProperties.get("persist.sys.axion_cpu_limit_bg", "0-1");
+-    private static final String CPUS_PARAMS_UI_LIMIT = SystemProperties.get("persist.sys.axion_cpu_limit_ui", "0-4");
+-    private static final String CPUS_PARAMS_UI_UNLIMIT = SystemProperties.get("persist.sys.axion_cpu_unlimit_ui", "0-7");
+-    private static final String CPUS_PARAMS_FG_UNLIMIT = SystemProperties.get("persist.sys.axion_cpu_fg", "0-5");
+-    private static final String CPUS_PARAMS_BG_UNLIMIT = SystemProperties.get("persist.sys.axion_cpu_bg", "0-2");
+-    private static final String CPUS_PARAMS_BIG_CORES = SystemProperties.get("persist.sys.axion_cpu_big", "4,5,6,7");
+-
+-    private static final String CPUS_PARAMS_BIG_LIMIT;
+-
+-    public static int REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_NOTIFICATION_EXPAND = 16;
+-    public static int REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_PLAY_SCREEN_OFF_ANIMATION = 256;
+-    public static int REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK = 1;
+-
+-    public static int REQUEST_ANIMATION_BOOST_TYPE_BASE = 1;
+-    public static int REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION = 1 << 1;
+-
+-    private static final int STATUS_BIND_BIG_CORE = 0;
+-    private static final int STATUS_BIND_SMALL_CORE = 1;
+-    private static final int STATUS_UNBIND = 2;
+-
+-    private static final long ANIMATION_BOOST_ON = 0L;
+-    private static final long ANIMATION_BOOST_OFF = -1L;
+-
+-    private int mAnimationBoostType = 0;
+-    private int mBindStatus = STATUS_UNBIND;
+-    private long mAnimationBoost = ANIMATION_BOOST_OFF;
+-
+-    private int mLimitOtherProcessCpuReason = 0;
+-    private boolean mLimitForegroundAppCpu = false;
+-    private boolean mLimitOtherProcessCpu = false;
+-    
+-    private static NTCpuBindController instance = null;
+-
+-    static {
+-        CPUS_PARAMS_BIG_LIMIT = getCpuRange(CPUS_PARAMS_BIG_CORES);
+-    }
+-
+-    private NTCpuBindController() {}
+-
+-    private static String getCpuRange(String cpuList) {
+-        IntSummaryStatistics stats = Arrays.stream(cpuList.split(","))
+-            .mapToInt(Integer::parseInt)
+-            .summaryStatistics();
+-        return stats.getMin() + "-" + stats.getMax();
+-    }
+-
+-    public static synchronized NTCpuBindController INSTANCE() {
+-        if (instance == null) {
+-            instance = new NTCpuBindController();
+-        }
+-        return instance;
+-    }
+-
+-    public void bindBigCore() {
+-        if (mBindStatus != STATUS_BIND_BIG_CORE) {
+-            mBindStatus = STATUS_BIND_BIG_CORE;
+-            executeSetThreadAffinity(STATUS_BIND_BIG_CORE);
+-        }
+-    }
+-
+-    public void bindSmallCore() {
+-        if (mBindStatus != STATUS_BIND_SMALL_CORE) {
+-            mBindStatus = STATUS_BIND_SMALL_CORE;
+-            executeSetThreadAffinity(STATUS_BIND_SMALL_CORE);
+-        }
+-    }
+-
+-    public void unbind() {
+-        if (mBindStatus != STATUS_UNBIND) {
+-            mBindStatus = STATUS_UNBIND;
+-            executeSetThreadAffinity(STATUS_UNBIND);
+-        }
+-    }
+-    
+-    public void animationBoost(int type, boolean enabled) {
+-        if (enabled) {
+-            animationBoostOn(type);
+-        } else {
+-            animationBoostOff(type);
+-        }
+-    }
+-
+-    private void animationBoostOn(int type) {
+-        mAnimationBoostType |= type;
+-        if (mAnimationBoost != ANIMATION_BOOST_ON) {
+-            executePerformanceMode(true);
+-            bindBigCore();
+-            mAnimationBoost = ANIMATION_BOOST_ON;
+-            executeSetAnimationBoost(ANIMATION_BOOST_ON);
+-        }
+-    }
+-
+-    private void animationBoostOff(int type) {
+-        mAnimationBoostType &= ~type;
+-        if (mAnimationBoostType <= 0 && mAnimationBoost != ANIMATION_BOOST_OFF) {
+-            unbind();
+-            mAnimationBoost = ANIMATION_BOOST_OFF;
+-            executeSetAnimationBoost(ANIMATION_BOOST_OFF);
+-            executePerformanceMode(false);
+-        }
+-    }
+-
+-    private void executeSetAnimationBoost(long boost) {
+-        try {
+-            final boolean enabled = boost == ANIMATION_BOOST_ON;
+-            int pid = Process.myPid();
+-            ActivityManager.getService().animationBoost(pid, enabled);
+-        } catch (Exception e) {
+-            Log.e(TAG, "Failed to call animationBoost", e);
+-        }
+-    }
+-
+-    private void executeSetThreadAffinity(int affinity) {
+-        try {
+-            int pid = Process.myPid();
+-            ActivityManager.getService().setThreadAffinity(pid, affinity);
+-        } catch (Exception e) {
+-            Log.e(TAG, "Failed to call setThreadAffinity", e);
+-        }
+-    }
+-    
+-    public void setLimitCpusForIdle(boolean limit) {
+-        if (limit) {
+-            // ui groups
+-            executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_LIMIT);
+-            executeAdjustCpusetCpus(FG_WINDOWN_GROUP, CPUS_PARAMS_UI_LIMIT);
+-            executeAdjustCpusetCpus(FG_GROUP, CPUS_PARAMS_UI_LIMIT);
+-            
+-            // bg groups
+-            executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(RESTRICTED_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(SYS_BG_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(BG_GROUP, CPUS_PARAMS_BG_LIMIT);
+-        } else {
+-            // ui groups
+-            executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            
+-            // fg groups
+-            executeAdjustCpusetCpus(FG_WINDOWN_GROUP, CPUS_PARAMS_FG_UNLIMIT);
+-            executeAdjustCpusetCpus(FG_GROUP, CPUS_PARAMS_FG_UNLIMIT);
+-            
+-            // bg groups
+-            executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(RESTRICTED_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(SYS_BG_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(BG_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-        }
+-    }
+-
+-    public void setLimitForegroundAppCpu(boolean limitForegroundAppCpu) {
+-        if (limitForegroundAppCpu != mLimitForegroundAppCpu) {
+-            if (limitForegroundAppCpu) {
+-                executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_BIG_LIMIT);
+-            } else {
+-                executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            }
+-            mLimitForegroundAppCpu = limitForegroundAppCpu;
+-        }
+-    }
+-
+-    public void setLimitOtherProcessCpu(boolean limitOtherProcessCpu) {    
+-        if (limitOtherProcessCpu != mLimitOtherProcessCpu) {
+-            if (limitOtherProcessCpu) {
+-                executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_BG_LIMIT);
+-                executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            } else {
+-                executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-                executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            }
+-            mLimitOtherProcessCpu = limitOtherProcessCpu;
+-        }
+-    }
+-
+-    public void requestLimitOtherProcessCPU(int type) {
+-        mLimitOtherProcessCpuReason = type | mLimitOtherProcessCpuReason;
+-        limitCameraHalCpu();
+-    }
+-
+-    public void requestUnLimitOtherProcessCPU(int type) {
+-        mLimitOtherProcessCpuReason = (~type) & mLimitOtherProcessCpuReason;
+-        limitCameraHalCpu();
+-    }
+-
+-    private void limitCameraHalCpu() {
+-        boolean limit = mLimitOtherProcessCpuReason > 0;
+-        setLimitOtherProcessCpu(limit);
+-    }
+-
+-    public void setLimitOtherAppCpu(boolean on) {
+-        if (on) {
+-            requestLimitOtherProcessCPU(REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK);
+-        } else {
+-            requestUnLimitOtherProcessCPU(REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK);
+-        }
+-        setLimitForegroundAppCpu(on);
+-    }
+-
+-    public void gameBoost(boolean boost) {
+-        if (boost) {
+-            executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(FG_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(FG_WINDOWN_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(RESTRICTED_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(BG_GROUP, CPUS_PARAMS_BG_LIMIT);
+-            executeAdjustCpusetCpus(SYS_BG_GROUP, CPUS_PARAMS_BG_LIMIT);
+-        } else {
+-            executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_UI_UNLIMIT);
+-            executeAdjustCpusetCpus(FG_GROUP, CPUS_PARAMS_FG_UNLIMIT);
+-            executeAdjustCpusetCpus(FG_WINDOWN_GROUP, CPUS_PARAMS_FG_UNLIMIT);
+-            executeAdjustCpusetCpus(RESTRICTED_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(BG_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-            executeAdjustCpusetCpus(SYS_BG_GROUP, CPUS_PARAMS_BG_UNLIMIT);
+-        }
+-    }
+-
+-    private void executeAdjustCpusetCpus(String path, String cpus) {
+-        try {
+-            ActivityManager.getService().executeAdjustCpusetCpus(path, cpus);
+-        } catch (Exception e) {
+-        }
+-    }
+-    
+-    private void executePerformanceMode(boolean enabled) {
+-        try {
+-            ActivityManager.getService().setPerformanceMode(enabled);
+-        } catch (Exception e) {
+-        }
+-    }
+-}
+diff --git a/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt b/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
+new file mode 100644
+index 000000000000..968a570558a7
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
+@@ -0,0 +1,168 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.systemui.util
++
++import android.os.Process
++import android.os.SystemProperties
++import com.android.internal.util.BoostHelper
++
++class NTCpuBindController private constructor() {
++
++    private var mAnimationBoostType = 0
++    private var mBindStatus = STATUS_UNBIND
++    private var mAnimationBoost = ANIMATION_BOOST_OFF
++
++    private var mLimitOtherProcessCpuReason = 0
++    private var mLimitForegroundAppCpu = false
++    private var mLimitOtherProcessCpu = false
++
++    fun bindBigCore() {
++        if (mBindStatus != STATUS_BIND_BIG_CORE) {
++            mBindStatus = STATUS_BIND_BIG_CORE
++            BoostHelper.setThreadAffinity(Process.myPid(), STATUS_BIND_BIG_CORE)
++        }
++    }
++
++    fun bindSmallCore() {
++        if (mBindStatus != STATUS_BIND_SMALL_CORE) {
++            mBindStatus = STATUS_BIND_SMALL_CORE
++            BoostHelper.setThreadAffinity(Process.myPid(), STATUS_BIND_SMALL_CORE)
++        }
++    }
++
++    fun unbind() {
++        if (mBindStatus != STATUS_UNBIND) {
++            mBindStatus = STATUS_UNBIND
++            BoostHelper.setThreadAffinity(Process.myPid(), STATUS_UNBIND)
++        }
++    }
++
++    fun animationBoost(type: Int, enabled: Boolean) {
++        if (enabled) animationBoostOn(type) else animationBoostOff(type)
++    }
++
++    fun animationBoostOn(type: Int) {
++        mAnimationBoostType = mAnimationBoostType or type
++        if (mAnimationBoost != ANIMATION_BOOST_ON) {
++            bindBigCore()
++            mAnimationBoost = ANIMATION_BOOST_ON
++            BoostHelper.animationBoost(Process.myPid(), true)
++        }
++    }
++
++    fun animationBoostOff(type: Int) {
++        mAnimationBoostType = mAnimationBoostType and type.inv()
++        if (mAnimationBoostType <= 0 && mAnimationBoost != ANIMATION_BOOST_OFF) {
++            unbind()
++            mAnimationBoost = ANIMATION_BOOST_OFF
++            BoostHelper.animationBoost(Process.myPid(), false)
++        }
++    }
++
++    fun setLimitForegroundAppCpu(limit: Boolean) {
++        if (limit != mLimitForegroundAppCpu) {
++            if (limit) {
++                BoostHelper.executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_SMALL_LIMIT)
++            } else { 
++                BoostHelper.executeAdjustCpusetCpus(TOP_APP_GROUP, CPUS_PARAMS_UI_UNLIMIT)
++            }
++            mLimitForegroundAppCpu = limit
++        }
++    }
++
++    fun setLimitOtherProcessCpu(limit: Boolean) {
++        if (limit != mLimitOtherProcessCpu) {
++            if (limit) {
++                BoostHelper.executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_BG_LIMIT)
++                BoostHelper.executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_BG_LIMIT)
++            } else {
++                BoostHelper.executeAdjustCpusetCpus(CAMERA_DAEMON_GROUP, CPUS_PARAMS_UI_UNLIMIT)
++                BoostHelper.executeAdjustCpusetCpus(DEX2OAT_GROUP, CPUS_PARAMS_UI_UNLIMIT)
++            }
++            mLimitOtherProcessCpu = limit
++        }
++    }
++
++    fun requestLimitOtherProcessCPU(type: Int) {
++        mLimitOtherProcessCpuReason = mLimitOtherProcessCpuReason or type
++        limitCameraHalCpu()
++    }
++
++    fun requestUnLimitOtherProcessCPU(type: Int) {
++        mLimitOtherProcessCpuReason = mLimitOtherProcessCpuReason and type.inv()
++        limitCameraHalCpu()
++    }
++
++    private fun limitCameraHalCpu() {
++        val limit = mLimitOtherProcessCpuReason > 0
++        setLimitOtherProcessCpu(limit)
++    }
++    
++    companion object {
++        private const val TAG = "NTCpuBindController"
++
++        private const val CPUSET_PATH = "/dev/cpuset/"
++        private const val CAMERA_DAEMON_GROUP = CPUSET_PATH + "camera-daemon/cpus"
++        private const val TOP_APP_GROUP = CPUSET_PATH + "top-app/cpus"
++        private const val FG_GROUP = CPUSET_PATH + "foreground/cpus"
++        private const val FG_WINDOW_GROUP = CPUSET_PATH + "foreground_window/cpus"
++        private const val SYS_BG_GROUP = CPUSET_PATH + "system-background/cpus"
++        private const val BG_GROUP = CPUSET_PATH + "background/cpus"
++        private const val DEX2OAT_GROUP = CPUSET_PATH + "dex2oat/cpus"
++
++        private val CPUS_PARAMS_BG_LIMIT = SystemProperties.get("persist.sys.axion_cpu_limit_bg", "0-1")
++        private val CPUS_PARAMS_UI_UNLIMIT = SystemProperties.get("persist.sys.axion_cpu_all", "0-7")
++        private val CPUS_PARAMS_SMALL_CORES = SystemProperties.get("persist.sys.axion_cpu_small", "0,1,2,3")
++        private val CPUS_PARAMS_SMALL_LIMIT = getCpuRange(CPUS_PARAMS_SMALL_CORES)
++
++        const val REQUEST_ANIMATION_BOOST_TYPE_BASE = 1
++        const val REQUEST_ANIMATION_BOOST_TYPE_FLING_NOTIFICATION_PANEL_VIEW = 1
++        const val REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_NOTIFICATION_EXPAND = 16
++        const val REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_PLAY_SCREEN_OFF_ANIMATION = 256
++        const val REQUEST_LIMIT_OTHER_PROCESS_CPU_WHEN_UNLOCK = 1
++
++        const val REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_PANEL_VIEW = 1 shl 1
++        const val REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_NOTIFICATION_PANEL_VIEW_EXPAND = 1 shl 2
++        const val REQUEST_ANIMATION_BOOST_TYPE_UNLOCK = 1 shl 3
++        const val REQUEST_ANIMATION_BOOST_TYPE_LIGHT_REVEAL = 1 shl 4
++        const val REQUEST_ANIMATION_BOOST_TYPE_TRACKING_NOTIFICATION_STACK_SCROLL_LAYOUT = 1 shl 5
++        const val REQUEST_ANIMATION_BOOST_TYPE_SPEED_UP_QS_EXPANSION_ANIMATION = 1 shl 6
++        const val REQUEST_ANIMATION_BOOST_TYPE_SWIPE_DOWN_NOTIFICATION_ANIMATION = 1 shl 7
++        const val REQUEST_ANIMATION_BOOST_TYPE_START_DOZE_ANIMATION = 1 shl 8
++
++        private const val STATUS_BIND_BIG_CORE = 0
++        private const val STATUS_BIND_SMALL_CORE = 1
++        private const val STATUS_UNBIND = 2
++
++        private const val ANIMATION_BOOST_ON = 0L
++        private const val ANIMATION_BOOST_OFF = -1L
++
++        private var instance: NTCpuBindController? = null
++
++        @JvmStatic
++        fun get(): NTCpuBindController {
++            if (instance == null) {
++                instance = NTCpuBindController()
++            }
++            return instance!!
++        }
++
++        private fun getCpuRange(cpuList: String): String {
++            val range = cpuList.split(",").map { it.toInt() }
++            return "${range.minOrNull() ?: 0}-${range.maxOrNull() ?: 0}"
++        }
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/util/TaskWorkerManager.kt b/packages/SystemUI/src/com/android/systemui/util/TaskWorkerManager.kt
+new file mode 100644
+index 000000000000..d1b3bd6dd81d
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/util/TaskWorkerManager.kt
+@@ -0,0 +1,51 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.systemui.util
++
++import android.os.Handler
++import android.os.HandlerThread
++
++class TaskWorkerManager private constructor() {
++
++    companion object {
++        val instance: TaskWorkerManager by lazy { TaskWorkerManager() }
++    }
++
++    val taskWorker: TaskWorker = TaskWorker("task_worker_default")
++
++    class TaskWorker(taskWorkerTag: String) {
++
++        private val handler: Handler
++
++        init {
++            val handlerThread = HandlerThread(taskWorkerTag)
++            handlerThread.start()
++            handler = Handler(handlerThread.looper)
++        }
++
++        fun post(runnable: Runnable) {
++            handler.post(runnable)
++        }
++
++        fun postDelayed(runnable: Runnable, delay: Long) {
++            handler.postDelayed(runnable, delay)
++        }
++
++        fun removeCallback(runnable: Runnable) {
++            handler.removeCallbacks(runnable)
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index 72544bc43df1..020716e6e0d9 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -438,6 +438,7 @@ import com.android.internal.util.function.pooled.PooledLambda;
+ import com.android.server.AlarmManagerInternal;
+ import com.android.server.BootReceiver;
+ import com.android.server.DeviceIdleInternal;
++import com.android.server.AnimationThread;
+ import com.android.server.DisplayThread;
+ import com.android.server.IoThread;
+ import com.android.server.LocalManagerRegistry;
+@@ -487,6 +488,8 @@ import com.android.server.wm.ActivityTaskManagerInternal;
+ import com.android.server.wm.ActivityTaskManagerService;
+ import com.android.server.wm.AppLockManagerService;
+ import com.android.server.wm.GameSpaceService;
++import com.android.server.wm.SurfaceAnimationThread;
++import com.android.server.wm.WindowEventDispatcher;
+ import com.android.server.wm.WindowManagerInternal;
+ import com.android.server.wm.WindowManagerService;
+ import com.android.server.wm.WindowProcessController;
+@@ -646,6 +649,8 @@ public class ActivityManagerService extends IActivityManager.Stub
+     private static final DateTimeFormatter DROPBOX_TIME_FORMATTER =
+             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSZ");
+ 
++    public static boolean mForceStopKill = false;
++
+     OomAdjuster mOomAdjuster;
+     @GuardedBy("this")
+     ProcessStateController mProcessStateController;
+@@ -766,6 +771,11 @@ public class ActivityManagerService extends IActivityManager.Stub
+     private final ArraySet<String> mDeliveryGroupPolicyIgnoredActions = new ArraySet();
+ 
+     private AccessCheckDelegateHelper mAccessCheckDelegateHelper;
++    
++    private final BoostAdjuster mBoostAdjuster;
++    private final MemoryManager mMemoryManager;
++    private final TaskProfiler mTaskProfiler = new TaskProfiler();
++    private final ProcessManager mProcessManager = new ProcessManager();
+ 
+     /**
+      * Uids of apps with current active camera sessions.  Access synchronized on
+@@ -1333,9 +1343,6 @@ public class ActivityManagerService extends IActivityManager.Stub
+     @GuardedBy("this") boolean mCallFinishBooting = false;
+     @GuardedBy("this") boolean mBootAnimationComplete = false;
+ 
+-    boolean mBoostingAnimation = false;
+-    int mTopAppPid = -1;
+-
+     final Context mContext;
+ 
+     /**
+@@ -2474,6 +2481,8 @@ public class ActivityManagerService extends IActivityManager.Stub
+         mComponentAliasResolver = new ComponentAliasResolver(this);
+         mApplicationSharedMemoryReadOnlyFd = null;
+         sCreatorTokenCacheCleaner = new Handler(mHandlerThread.getLooper());
++        mBoostAdjuster = new BoostAdjuster(this);
++        mMemoryManager = new MemoryManager(this);
+     }
+ 
+     // Note: This method is invoked on the main thread but may need to attach various
+@@ -2600,6 +2609,9 @@ public class ActivityManagerService extends IActivityManager.Stub
+             Slog.e(TAG, "Failed to get read only fd for shared memory", e);
+             throw new RuntimeException(e);
+         }
++        
++        mBoostAdjuster = new BoostAdjuster(this);
++        mMemoryManager = new MemoryManager(this);
+     }
+ 
+     void setBroadcastQueueForTest(BroadcastQueue broadcastQueue) {
+@@ -4281,6 +4293,7 @@ public class ActivityManagerService extends IActivityManager.Stub
+         // A specific subset of the work done in forceStopPackageLocked(), because we are
+         // intentionally not rendering the app nonfunctional; we're just halting its current
+         // execution.
++        mForceStopKill = true;
+         final int appId = UserHandle.getAppId(uid);
+         synchronized (this) {
+             synchronized (mProcLock) {
+@@ -4363,6 +4376,7 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+             mAppErrors.resetProcessCrashTime(packageName == null, appId, userId);
+         }
++        mForceStopKill = true;
+ 
+         synchronized (mProcLock) {
+             // Notify first that the package is stopped, so its process won't be restarted
+@@ -5265,7 +5279,12 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+             // Start PSI monitoring in LMKD if it was skipped earlier.
+             ProcessList.startPsiMonitoringAfterBoot();
+-            initTaskProfiles();
++            mTaskProfiler.initTaskProfiles();
++            mMemoryManager.updateExtraFree();
++            
++            mHandler.postDelayed(() -> {
++                SystemProperties.set("persist.sys.axion_boot_completed", "1");
++            }, 5000);
+ 
+             mUserController.onBootComplete(
+                     new IIntentReceiver.Stub() {
+@@ -7458,6 +7477,7 @@ public class ActivityManagerService extends IActivityManager.Stub
+                 mProcessStateController.setWakefulness(wakefulness);
+ 
+                 updateOomAdjLocked(OOM_ADJ_REASON_UI_VISIBILITY);
++                mBoostAdjuster.onWakefulnessChanged(isAwake);
+             }
+         }
+     }
+@@ -9231,7 +9251,8 @@ public class ActivityManagerService extends IActivityManager.Stub
+             mComponentAliasResolver.onSystemReady(mConstants.mEnableComponentAlias,
+                     mConstants.mComponentAliasOverrides);
+             t.traceEnd(); // componentAlias
+-
++            mProcessManager.systemReady(this, mContext);
++            mBoostAdjuster.systemReady(mContext);
+             t.traceEnd(); // PhaseActivityManagerReady
+         }
+     }
+@@ -19570,264 +19591,44 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+     @Override
+     public void releaseMemory(int minAdj, int maxKillCount, boolean includeUIProcesses, boolean skipCamera) {
+-        if (minAdj == 0) return;
+-
+-        try {
+-            ArrayList<ProcessRecord> processList = 
+-                (ArrayList<ProcessRecord>) mProcessList.getLruProcessesLOSP().clone();
+-
+-            ArrayList<ProcessToKill> toKill = new ArrayList<>();
+-
+-            for (ProcessRecord record : processList) {
+-                if (record != null && record.getSetAdj() >= minAdj) {
+-                    boolean hasUI = record.hasActivities();
+-                    if (!hasUI || includeUIProcesses) {
+-                        toKill.add(new ProcessToKill(record));
+-                    }
+-                }
+-            }
+-
+-            Collections.sort(toKill, new ProcessComparator());
+-
+-            int killedCount = 0;
+-            for (ProcessToKill info : toKill) {
+-                Process.killProcess(info.pid);
+-                killedCount++;
+-                if (killedCount >= maxKillCount) return;
+-            }
+-
+-        } catch (Exception e) {
+-        }
++        mMemoryManager.releaseMemory(minAdj, maxKillCount, includeUIProcesses, skipCamera);
+     }
+ 
+     @Override
+     public void executeAdjustCpusetCpus(String path, String cpuset) {
+-        File file = new File(path);
+-        if (!file.exists()) {
+-            return;
+-        }
+-        try (FileWriter writer = new FileWriter(file)) {
+-            writer.write(cpuset);
+-            writer.flush();
+-        } catch (IOException e) {
+-            Log.e("executeAdjustCpusetCpus", "Failed to write to " + path + ": " + e.getMessage());
+-        }
++        mBoostAdjuster.write(path, cpuset);
+     }
+ 
+     @Override
+-    public void adjustCpusetCpus(String path, String cpuset, long durationMillis) {
+-        File file = new File(path);
+-        if (!file.exists()) {
+-            return;
+-        }
+-        String originalCpuset = null;
+-
+-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+-            originalCpuset = reader.readLine();
+-        } catch (IOException e) {
+-            Log.e("adjustCpusetCpus", "Failed to read original cpuset from " + path + ": " + e.getMessage());
+-            return;
+-        }
+-
+-        executeAdjustCpusetCpus(path, cpuset);
+-
+-        String restoreCpuset = originalCpuset;
+-        mHandler.postDelayed(() -> executeAdjustCpusetCpus(path, restoreCpuset), durationMillis);
+-    }
+-
+-    private String getTopAppPackageName() {
+-        String currentPackage;
+-        try {
+-            RunningTaskInfo rti = mActivityTaskManager.getTasks(
+-                1, false /* filterVisibleRecents */, false /*keepIntentExtra */,
+-                INVALID_DISPLAY).get(0);
+-            currentPackage = rti.topActivity.getPackageName();
+-        } catch (Exception e) {
+-            currentPackage = null;
+-        }
+-        return currentPackage;
+-    }
+-
+-    private boolean isTopAppGame(String packageName) {
+-        if (packageName == null) return false;
+-        boolean isGame = false;
+-        try {
+-            ApplicationInfo ai = mContext.getPackageManager().getApplicationInfo(packageName, 0);
+-            if(ai != null) {
+-                isGame = (ai.category == ApplicationInfo.CATEGORY_GAME) ||
+-                        ((ai.flags & ApplicationInfo.FLAG_IS_GAME) ==
+-                            ApplicationInfo.FLAG_IS_GAME);
+-            }
+-        } catch (Exception e) {
+-            return false;
+-        }
+-        return isGame;
++    public void adjustCpusetCpus(String cgroup, long durationMillis) {
++        mBoostAdjuster.adjustCpusetCpus(cgroup, durationMillis);
+     }
+ 
+     @Override
+     public void animationBoost(int pid, boolean enabled) {
+-        ProcessRecord curProc;
+-        synchronized (mPidsSelfLocked) {
+-            curProc = mPidsSelfLocked.get(pid);
+-        }
+-        if (curProc == null) {
+-            return;
+-        }
+-
+-        if (enabled) {
+-            String topApp = getTopAppPackageName();
+-            if (topApp == null) {
+-                return;
+-            }
+-
+-            ProcessRecord topAppProc = getProcessRecord(topApp);
+-            if (topAppProc == null) {
+-                return;
+-            }
+-
+-            int topAppPid = topAppProc.getPid();
+-            int group = Process.THREAD_GROUP_DEFAULT;
+-            int priority = Process.THREAD_PRIORITY_DEFAULT;
+-            try {
+-                Process.setProcessGroup(topAppPid, group);
+-                Process.setThreadGroupAndCpuset(topAppPid, group);
+-                Process.setThreadPriority(topAppPid, priority);
+-                setThreadAffinity(topAppPid, 1);
+-                mTopAppPid = topAppPid;
+-            } catch (Exception e) {
+-                Slog.w(TAG, "Failed to demote top-app process: " + e);
+-                mTopAppPid = -1;
+-                return;
+-            }
+-        } else {
+-            if (mTopAppPid != -1) {
+-                try {
+-                    Process.setProcessGroup(mTopAppPid, Process.THREAD_GROUP_TOP_APP);
+-                    Process.setThreadGroupAndCpuset(mTopAppPid, Process.THREAD_GROUP_TOP_APP);
+-                    Process.setThreadPriority(mTopAppPid, Process.THREAD_PRIORITY_TOP_APP_BOOST);
+-                    setThreadAffinity(mTopAppPid, 2);
+-                } catch (Exception e) {
+-                    Slog.w(TAG, "Failed to restore top-app process group: " + e);
+-                } finally {
+-                    mTopAppPid = -1;
+-                }
+-            }
+-        }
+-
+-        setFifoPriority(curProc, enabled, 99);
+-        mBoostingAnimation = enabled;
++         mBoostAdjuster.animationBoost(pid, enabled);
+     }
+ 
+     @Override
+     public void setThreadAffinity(int pid, int affinity) {
+-        ProcessRecord curProc;
+-        synchronized (mPidsSelfLocked) {
+-            curProc = mPidsSelfLocked.get(pid);
+-        }
+-        if (curProc == null) {
+-            return;
+-        }
+-
+-        int threadGroup = (affinity == 0)
+-                ? Process.THREAD_GROUP_TOP_APP
+-                : Process.THREAD_GROUP_DEFAULT;
+-
+-        Process.setThreadGroupAndCpuset(pid, threadGroup);
+-        Process.setThreadAffinity(pid, affinity);
+-        
+-        int rTid = curProc.getRenderThreadTid();
+-        if (rTid == 0) return;
+-        Process.setThreadGroupAndCpuset(rTid, threadGroup);
+-        Process.setThreadAffinity(rTid, affinity);
++        mBoostAdjuster.setThreadAffinity(pid, affinity);
+     }
+ 
+     @Override
+-    public boolean isBoostingAnimation() {
+-        return mBoostingAnimation;
++    public void setPerformanceMode(boolean enabled, String reason) {
++       mBoostAdjuster.setPerformanceMode(enabled, reason);
+     }
+ 
+     @Override
+-    public void setPerformanceMode(boolean enabled) {
+-        if (enabled && isTopAppGame(getTopAppPackageName())) return;
+-        if (mLocalPowerManager != null) {
+-            // alway reset to retrigger LAUNCH powerhint
+-            if (enabled) {
+-                mLocalPowerManager.setPowerMode(Mode.LAUNCH, false);
+-            }
+-            mLocalPowerManager.setPowerMode(Mode.LAUNCH, enabled);
+-            mLocalPowerManager.setPowerMode(
+-                PowerManagerInternal.MODE_FIXED_PERFORMANCE, enabled);
+-        }
+-    }
+-
+-    public class ProcessComparator implements Comparator<ProcessToKill> {
+-        @Override
+-        public int compare(ProcessToKill p1, ProcessToKill p2) {
+-            return Integer.compare(p2.adj, p1.adj);
+-        }
++    public void boostHint(final String reason, final long duration) {
++        mBoostAdjuster.boostHint(duration);
+     }
+ 
+-    public static final class ProcessToKill {
+-        public int adj;
+-        public String name; 
+-        public int pid;
+-        public int uid;
+-        public ProcessRecord record;
+-
+-        public ProcessToKill(ProcessRecord record) {
+-            this.pid = record.getPid();
+-            this.uid = record.uid;
+-            this.adj = record.getSetAdj();
+-            this.name = record.processName;
+-            this.record = record;
+-        }
+-    }
+-    
+-    private void initTaskProfiles() {
+-        String[] bgProfiles = { "ProcessCapacityLow" };
+-        String[] bgProcs = { "kswapd", "kcompactd" };
+-        setTaskProfilesForProcs(bgProcs, bgProfiles);
++    @Override
++    public void inputBoost(long durationMillis) {
++        mBoostAdjuster.inputBoost(durationMillis);
+     }
+-    
+-    public static void setTaskProfilesForProcs(String[] procGroups, String[] profiles) {
+-        File procDir = new File("/proc");
+-        File[] entries = procDir.listFiles(file -> file.isDirectory() && file.getName().matches("\\d+"));
+-        if (entries == null) {
+-            Slog.w("setTaskProfilesForProcs", "/proc not accessible or empty.");
+-            return;
+-        }
+-
+-        for (File pidDir : entries) {
+-            File commFile = new File(pidDir, "comm");
+-            String processName = null;
+-
+-            try (BufferedReader reader = new BufferedReader(new FileReader(commFile))) {
+-                processName = reader.readLine();
+-            } catch (IOException e) {
+-                Slog.w("setTaskProfilesForProcs", "Could not read " + commFile.getPath() + ": " + e);
+-                continue;
+-            }
+ 
+-            if (processName == null) continue;
+-
+-            for (String proc : procGroups) {
+-                if (processName.contains(proc)) {
+-                    try {
+-                        int pid = Integer.parseInt(pidDir.getName());
+-                        Process.setTaskProfiles(pid, profiles);
+-                        Slog.i("setTaskProfilesForProcs", "Applied profiles " + Arrays.toString(profiles) +
+-                                " to process " + processName + " (PID " + pid + ")");
+-                    } catch (NumberFormatException e) {
+-                        Slog.w("setTaskProfilesForProcs", "Invalid PID: " + pidDir.getName());
+-                    } catch (Exception e) {
+-                        Slog.w("setTaskProfilesForProcs", "Failed to set profiles for PID " + pidDir.getName() + ": " + e);
+-                    }
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-    
+     @Override
+     public boolean shouldForceLongScreen(String packageName) {
+         return mActivityTaskManager.shouldForceLongScreen(packageName);
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+new file mode 100644
+index 000000000000..2388a6efa845
+--- /dev/null
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -0,0 +1,448 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.server.am;
++
++import android.content.Context;
++import android.database.ContentObserver;
++import android.net.Uri;
++import android.os.*;
++import android.os.Process;
++import android.util.Slog;
++import android.provider.Settings;
++
++import com.android.server.UiThread;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++
++public class BoostAdjuster {
++
++    private static final String TAG = "BoostAdjuster";
++
++    public static final int THREAD_GROUP_NT_FOREGROUND = 10;
++    public static final int THREAD_GROUP_RESTRICTED = Process.THREAD_GROUP_RESTRICTED;
++
++    private final ActivityManagerService mAm;
++    private final HandlerThread mHandlerThread;
++    private final BoostHandler mHandler;
++    private final UiHandler mUiHandler;
++    private final BoostConfig mConfig;
++    private ConfigObserver mConfigObserver;
++
++    private final HashMap<Integer, Boolean> sBoostedPids = new HashMap<>();
++    private final HashMap<String, Boolean> sPerfMap = new HashMap<>();
++    private boolean mPerfMode = false;
++    private boolean mBoostingSf = false;
++    private boolean mInputBoosting = false;
++
++    public static final ArrayList<String> sAppWhiteList = new ArrayList<>();
++    public static final ArrayList<String> sAppPerfList = new ArrayList<>();
++    public static final ArrayList<String> CAMERA_APPS = new ArrayList<>();
++
++    static {
++        sAppWhiteList.add("com.google.android.providers.media.module");
++        sAppWhiteList.add("android.process.media");
++        sAppWhiteList.add("android.os.cts");
++        sAppPerfList.add("com.android.systemui");
++        sAppPerfList.add("com.android.launcher3");
++        CAMERA_APPS.add("com.google.android.GoogleCamera");
++        CAMERA_APPS.add("org.lineageos.aperture");
++        CAMERA_APPS.add("com.oplus.camera");
++    }
++
++    public BoostAdjuster(ActivityManagerService am) {
++        mAm = am;
++        mHandlerThread = new HandlerThread("BoostAdjusterThread");
++        mHandlerThread.start();
++        mHandler = new BoostHandler(mHandlerThread.getLooper(), this);
++        mUiHandler = new UiHandler(UiThread.getHandler().getLooper(), this);
++        mConfig = new BoostConfig();
++    }
++    
++    public void systemReady(Context context) {
++        mConfigObserver = new ConfigObserver(new Handler(), context);
++    }
++
++    public void write(String path, String value) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_WRITE, new WriteParams(path, value)));
++    }
++
++    public void adjustCpusetCpus(String cgroup, long durationMillis) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_ADJUST_CPUSET,
++                new AdjustCpusetParams(cgroup, durationMillis)));
++    }
++
++    public void animationBoost(int pid, boolean enabled) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_ANIMATION_BOOST, enabled ? 1 : 0, pid));
++    }
++
++    public void setThreadAffinity(int pid, int affinity) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_SET_THREAD_AFFINITY, affinity, pid));
++    }
++
++    public void setPerformanceMode(boolean enabled, String reason) {
++        synchronized (sPerfMap) {
++            if (sPerfMap.containsKey(reason) && sPerfMap.get(reason) == enabled) return;
++            mHandler.removeMessages(BoostHandler.MSG_SET_PERFORMANCE_MODE);
++            sPerfMap.put(reason, enabled);
++            boolean boost = sPerfMap.containsValue(true);
++            mHandler.sendMessage(
++                mHandler.obtainMessage(BoostHandler.MSG_SET_PERFORMANCE_MODE, boost ? 1 : 0, 0)
++            );
++        }
++    }
++
++    public void boostHint(long duration) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_BOOST_HINT, (int) duration, 0));
++    }
++
++    public void inputBoost(long durationMillis) {
++        mUiHandler.removeMessages(UiHandler.MSG_DISABLE_INPUT_BOOST);
++        mUiHandler.sendMessage(mUiHandler.obtainMessage(UiHandler.MSG_INPUT_BOOST, (int) durationMillis, 0));
++        mUiHandler.sendMessageDelayed(
++                mUiHandler.obtainMessage(UiHandler.MSG_DISABLE_INPUT_BOOST),
++                durationMillis
++        );
++    }
++
++    public void onWakefulnessChanged(boolean awake) {
++        mHandler.sendMessage(mHandler.obtainMessage(BoostHandler.MSG_ON_WAKEFULNESS_CHANGED, awake ? 1 : 0, 0));
++    }
++
++    private void adjustCpusetInternal(String cgroup, long durationMillis) {
++        if (cgroup == null) return;
++        adjustCpuset(cgroup, true);
++        mHandler.postDelayed(() -> adjustCpuset(cgroup, false), durationMillis);
++    }
++
++    private void adjustCpuset(String cgroup, boolean boost) {
++        String cpuset;
++        switch (cgroup) {
++            case "nt_foreground":
++                cpuset = boost ? mConfig.getData().allCores() : BoostConfig.FG_LIMIT;
++                break;
++            case "background":
++                cpuset = boost ? BoostConfig.BG_CPU : BoostConfig.BG_LIMIT;
++                break;
++            default:
++                return;
++        }
++        mConfig.writeInternal(mConfig.cpuPath(cgroup), cpuset);
++    }
++
++    private void animationBoostInternal(int pid, boolean enabled) {
++        ProcessRecord proc;
++        synchronized (mAm.mPidsSelfLocked) {
++            proc = mAm.mPidsSelfLocked.get(pid);
++        }
++        if (proc == null) return;
++        final int renderTid = proc.getRenderThreadTid();
++        final int prio = Process.getThreadPriority(pid);
++        try {
++            if (enabled) {
++                mAm.scheduleAsFifoPriority(pid, true, 1);
++                if (renderTid > 0) mAm.scheduleAsFifoPriority(renderTid, true, 10);
++            } else {
++                Process.setThreadScheduler(pid, 0, 0);
++                Process.setThreadPriority(prio);
++                Process.setThreadScheduler(renderTid, 0, 0);
++            }
++        } catch (Exception ignored) {}
++        boostPid(pid, enabled);
++        boostSF(enabled);
++    }
++
++    public void setThreadAffinityInternal(int pid, int affinity) {
++        if (affinity == 0) {
++            Process.setThreadGroupAndCpuset(pid, Process.THREAD_GROUP_TOP_APP);
++        } else {
++            Process.setThreadGroupAndCpuset(pid, Process.THREAD_GROUP_FOREGROUND);
++        }
++        Process.setThreadAffinity(pid, affinity);
++    }
++
++    private void setPerformanceModeInternal(boolean enabled) {
++        if (!mConfig.getData().cpuBoost()) {
++            if (mPerfMode) setPerfMode(false);
++            return;
++        }
++        if (mPerfMode == enabled) return;
++        setPerfMode(enabled);
++    }
++
++    private void setPerfMode(boolean enabled) {
++        int freq = enabled ? mConfig.getData().freqBoost() : 0;
++        int bigCoreFreq = (enabled && mConfig.getData().bigCoreBoost()) ? mConfig.getData().freqBoostBig() : 0;
++        mConfig.writeInternal(mConfig.getData().littleMin(), String.valueOf(freq));
++        mConfig.writeInternal(mConfig.getData().bigMin(), String.valueOf(bigCoreFreq));
++        mConfig.writeInternal(mConfig.getData().primeMin(), String.valueOf(bigCoreFreq));
++        if (mConfig.getData().boostSf()) boostSF(enabled);
++        mPerfMode = enabled;
++    }
++
++    private void inputBoostInternal(boolean enabled) {
++        if (mInputBoosting == enabled) return;
++        
++        if (mConfig.getData().inputBoost()) {
++            setPerformanceModeInternal(enabled);
++        }
++        adjustCpuset("background", enabled);
++        adjustCpuset("nt_foreground", enabled);
++        SystemProperties.set("dalvik.vm.dex2oat-threads", enabled ? "1" : "2");
++        mInputBoosting = enabled;
++    }
++
++    private void boostSF(boolean enable) {
++        if (!mConfig.getData().cpuBoost() || !mConfig.getData().boostSf()) enable = false;
++        if (mBoostingSf == enable) return;
++
++        IBinder sfBinder = ServiceManager.getService("SurfaceFlinger");
++        if (sfBinder != null) {
++            Parcel data = Parcel.obtain();
++            try {
++                data.writeInterfaceToken("android.ui.ISurfaceComposer");
++                data.writeInt(enable ? 1 : 0);
++                sfBinder.transact(1048, data, null, 0);
++            } catch (Exception e) {
++                logger("boostSF transact failed: " + e);
++            } finally {
++                data.recycle();
++            }
++        }
++
++        String val = enable ? String.valueOf(BoostConfig.SF_UC_MIN_BOOST) : "0";
++        mConfig.writeInternal(mConfig.DISPLAY_UC_MIN, val);
++        mConfig.writeInternal(mConfig.DISPLAY_UC_MAX, "100");
++
++        mBoostingSf = enable;
++    }
++
++    private void boostPid(int pid, boolean enable) {
++        if (!mConfig.getData().cpuBoost()) enable = false;
++        if (sBoostedPids.containsKey(pid) && sBoostedPids.get(pid) == enable) return;
++
++        String boostVal = enable ? "100" : "0";
++        mConfig.writeInternal(mConfig.RESTRICTED_UC_MIN, boostVal);
++        mConfig.writeInternal(mConfig.RESTRICTED_UC_MAX, "100");
++        mConfig.writeInternal(mConfig.CPU_RESTRICTED, enable ? mConfig.getData().bigCores() : mConfig.getData().allCores());
++        mConfig.writeInternal(enable ? mConfig.RESTRICTED_PROCS : mConfig.ROOT_PROCS, String.valueOf(pid));
++
++        sBoostedPids.put(pid, enable);
++    }
++
++    private void restrictBackground(boolean limit) {
++        mConfig.writeInternal(mConfig.CPU_BG, limit ? BoostConfig.BG_LIMIT : BoostConfig.FG_LIMIT);
++        mConfig.writeInternal(mConfig.CPU_NT_FG, limit ? BoostConfig.BG_LIMIT : BoostConfig.BG_CPU);
++    }
++
++    private void onWakefulnessChangedInternal(boolean awake) {
++        restrictBackground(!awake);
++    }
++
++    private static boolean needsControl(ProcessRecord app, boolean verifyGroup, int oldScheduleGroup) {
++        if (verifyGroup && oldScheduleGroup == ProcessList.SCHED_GROUP_TOP_APP && app.hasActivities()) {
++            logger("previous schedule group is top, not need limit!");
++            return false;
++        }
++        if (app.uid % 100000 < 10000 || isInPerfList(app.processName) || isInWhiteList(app.processName)) {
++            logger("system app not need limit!");
++            return false;
++        }
++        if (app.getHostingRecord() == null || app.getHostingRecord().isTopApp()) {
++            return false;
++        }
++        logger("process : " + app.processName + " is not top!");
++        return true;
++    }
++
++    public static boolean isForegroundNeedSelfControll(int oldScheduleGroup, ProcessRecord app) {
++        return needsControl(app, true, oldScheduleGroup);
++    }
++
++    public static boolean isRestrictedNeedSelfControll(ProcessRecord app) {
++        return needsControl(app, false, -1);
++    }
++
++    public static boolean isInWhiteList(String processName) {
++        return processName != null && sAppWhiteList.contains(processName);
++    }
++
++    public static boolean isInPerfList(String processName) {
++        return processName != null && (sAppPerfList.contains(processName) || isCamera(processName));
++    }
++
++    public static boolean isCamera(String processName) {
++        return processName != null && CAMERA_APPS.contains(processName);
++    }
++
++    public static void boostCamera(boolean boost) {
++        SystemProperties.set(BoostConfig.SCALING_GOV, boost ? BoostConfig.PERF_GOV : BoostConfig.DEFAULT_GOV);
++    }
++
++    public static boolean isBoosted() {
++        return BoostConfig.PERF_GOV.equals(BoostConfig.scalingGov());
++    }
++
++    private static class BoostHandler extends Handler {
++        static final int MSG_WRITE = 1;
++        static final int MSG_ADJUST_CPUSET = 2;
++        static final int MSG_DISABLE_BOOST_HINT = 3;
++        static final int MSG_ANIMATION_BOOST = 4;
++        static final int MSG_SET_THREAD_AFFINITY = 5;
++        static final int MSG_SET_PERFORMANCE_MODE = 6;
++        static final int MSG_BOOST_HINT = 7;
++        static final int MSG_ON_WAKEFULNESS_CHANGED = 8;
++
++        private final BoostAdjuster mAdjuster;
++
++        BoostHandler(Looper looper, BoostAdjuster adjuster) {
++            super(looper);
++            mAdjuster = adjuster;
++        }
++
++        @Override
++        public void handleMessage(Message msg) {
++            switch (msg.what) {
++                case MSG_WRITE:
++                    WriteParams wp = (WriteParams) msg.obj;
++                    mAdjuster.mConfig.writeInternal(wp.path, wp.value);
++                    break;
++                case MSG_ADJUST_CPUSET:
++                    AdjustCpusetParams cp = (AdjustCpusetParams) msg.obj;
++                    mAdjuster.adjustCpusetInternal(cp.cgroup, cp.durationMillis);
++                    break;
++                case MSG_DISABLE_BOOST_HINT:
++                    mAdjuster.setPerformanceModeInternal(false);
++                    break;
++                case MSG_ANIMATION_BOOST:
++                    mAdjuster.animationBoostInternal(msg.arg2, msg.arg1 == 1);
++                    break;
++                case MSG_SET_THREAD_AFFINITY:
++                    mAdjuster.setThreadAffinityInternal(msg.arg2, msg.arg1);
++                    break;
++                case MSG_SET_PERFORMANCE_MODE:
++                    mAdjuster.setPerformanceModeInternal(msg.arg1 == 1);
++                    break;
++                case MSG_BOOST_HINT:
++                    mAdjuster.setPerformanceModeInternal(true);
++                    sendEmptyMessageDelayed(MSG_DISABLE_BOOST_HINT, msg.arg1);
++                    break;
++                case MSG_ON_WAKEFULNESS_CHANGED:
++                    mAdjuster.onWakefulnessChangedInternal(msg.arg1 == 1);
++                    break;
++                default:
++                    logger("Unknown message: " + msg.what);
++            }
++        }
++    }
++
++    private static class UiHandler extends Handler {
++        static final int MSG_INPUT_BOOST = 1;
++        static final int MSG_DISABLE_INPUT_BOOST = 2;
++
++        private final BoostAdjuster mAdjuster;
++
++        UiHandler(Looper looper, BoostAdjuster adjuster) {
++            super(looper);
++            mAdjuster = adjuster;
++        }
++
++        @Override
++        public void handleMessage(Message msg) {
++            switch (msg.what) {
++                case MSG_INPUT_BOOST:
++                    mAdjuster.inputBoostInternal(true);
++                    break;
++                case MSG_DISABLE_INPUT_BOOST:
++                    mAdjuster.inputBoostInternal(false);
++                    break;
++                default:
++                    logger("Unknown UI message: " + msg.what);
++            }
++        }
++    }
++
++    private static class WriteParams {
++        final String path;
++        final String value;
++        WriteParams(String path, String value) { this.path = path; this.value = value; }
++    }
++
++    private static class AdjustCpusetParams {
++        final String cgroup;
++        final long durationMillis;
++        AdjustCpusetParams(String cgroup, long durationMillis) { this.cgroup = cgroup; this.durationMillis = durationMillis; }
++    }
++
++    private final class ConfigObserver extends ContentObserver {
++        private final Context mContext;
++
++        ConfigObserver(Handler handler, Context context) {
++            super(handler);
++            mContext = context;
++            register();
++            onChange(true);
++        }
++
++        void register() {
++            registerKey("axion_cpu_boost");
++            registerKey("axion_big_core_boost");
++            registerKey("axion_sf_boost");
++            registerKey("axion_touch_boost");
++            registerKey("axion_min_freq_boost");
++            registerKey("axion_min_freq_big_boost");
++        }
++
++        private void registerKey(String key) {
++            Uri uri = Settings.Secure.getUriFor(key);
++            if (uri != null) {
++                mContext.getContentResolver().registerContentObserver(uri, false, this);
++            }
++        }
++
++        @Override
++        public void onChange(boolean selfChange) {
++            boolean cpuBoost = intSetting("axion_cpu_boost", 1) == 1;
++            boolean bigCoreBoost = intSetting("axion_big_core_boost", 0) == 1;
++            boolean sfBoost = intSetting("axion_sf_boost", 1) == 1;
++            boolean touchBoost = intSetting("axion_touch_boost", 0) == 1;
++            int minFreqLittle = intSetting("axion_min_freq_boost", 1000000);
++            int minFreqBig = intSetting("axion_min_freq_big_boost", 1000000);
++            mConfig.updateSettings(cpuBoost, bigCoreBoost, sfBoost, touchBoost, minFreqLittle, minFreqBig);
++            applyConfig();
++        }
++        
++        private int intSetting(String key, int def) {
++            return Settings.Secure.getIntForUser(mContext.getContentResolver(), key, def, UserHandle.USER_CURRENT);
++        }
++    }
++
++    private void applyConfig() {
++        if (mPerfMode) {
++            setPerfMode(true);
++        }
++        if (mInputBoosting) {
++            inputBoostInternal(true);
++        }
++        if (mBoostingSf) {
++            boostSF(true);
++        }
++    }
++
++    private static void logger(String msg) {
++        if (SystemProperties.getBoolean("persist.sys.ax_boost_debug", false)) Slog.d(TAG, msg);
++    }
++}
+diff --git a/services/core/java/com/android/server/am/BoostConfig.java b/services/core/java/com/android/server/am/BoostConfig.java
+new file mode 100644
+index 000000000000..10cd35c8fe07
+--- /dev/null
++++ b/services/core/java/com/android/server/am/BoostConfig.java
+@@ -0,0 +1,334 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.server.am;
++
++import android.os.FileUtils;
++import android.os.SystemProperties;
++import android.util.Slog;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++
++public final class BoostConfig {
++    private static final String TAG = "BoostConfig";
++    private static final String AX_PROP = "persist.sys.axion_";
++
++    private final CpuData cData;
++    private BoostData data;
++
++    private static final String CPU_SYS_PATH = "/sys/devices/system/cpu/cpu";
++    private static final String SCALING_MIN_FREQ_FILE = "/cpufreq/scaling_min_freq";
++    private static final String SCALING_MAX_FREQ_FILE = "/cpufreq/scaling_max_freq";
++
++    public static final int SF_UC_MIN_BOOST =
++            Math.round(SystemProperties.getInt("ro.surface_flinger.uclamp.min", 100) * 100f / 1024f);
++
++    public final String CPU_BG = cpuPath("background");
++    public final String CPU_NT_FG = cpuPath("nt_foreground");
++    public final String CPU_RESTRICTED = cpuPath("restricted");
++    public final String CPU_DISPLAY = cpuPath("display");
++
++    public final String ROOT_PROCS = cpuCtlPath("", "/cgroup.procs");
++    public final String RESTRICTED_PROCS = cpuCtlPath("restricted", "/cgroup.procs");
++    public final String RESTRICTED_UC_MAX = cpuCtlPath("restricted", "/cpu.uclamp.max");
++    public final String RESTRICTED_UC_MIN = cpuCtlPath("restricted", "/cpu.uclamp.min");
++    public final String DISPLAY_UC_MAX = cpuCtlPath("display", "/cpu.uclamp.max");
++    public final String DISPLAY_UC_MIN = cpuCtlPath("display", "/cpu.uclamp.min");
++
++    public final static String SCALING_GOV = "persist.sys.scaling_governor";
++    public final static String DEFAULT_GOV = prop("default_scaling_gov", "schedutil");
++    public final static String PERF_GOV = "performance";
++    public static final String BG_CPU = prop("cpu_bg", "0-3");
++    public static final String BG_LIMIT = prop("cpu_limit_bg", "0-1");
++    public static final String FG_LIMIT = prop("cpu_limit_ui", "0-2");
++
++    public BoostConfig() {
++        cData = initCpuProps();
++    }
++
++    public BoostData getData() {
++        return data;
++    }
++
++    public static String scalingGov() {
++        return prop(SCALING_GOV, "schedutil");
++    }
++
++    public void updateSettings(
++            boolean cpuBoost, 
++            boolean bigCoreBoost, 
++            boolean boostSf, 
++            boolean inputBoost,
++            int freqBoost,
++            int freqBoostBig
++    ) {
++        data = new BoostData(
++                cpuBoost, bigCoreBoost, boostSf, inputBoost, freqBoost,
++                cData.smallCores, cData.bigCores, cData.primeCores,
++                cData.littleMin, cData.bigMin, cData.primeMin,
++                cData.littleMax, cData.bigMax, cData.primeMax, 
++                cData.allCores, freqBoostBig
++        );
++        logger("updateSettings: " + data);
++    }
++
++    public record BoostData(
++            boolean cpuBoost,
++            boolean bigCoreBoost,
++            boolean boostSf,
++            boolean inputBoost,
++            int freqBoost,
++            String smallCores,
++            String bigCores,
++            String primeCores,
++            String littleMin,
++            String bigMin,
++            String primeMin,
++            String littleMax,
++            String bigMax,
++            String primeMax,
++            String allCores,
++            int freqBoostBig
++    ) {}
++
++    private record CpuData(
++            String smallCores, String bigCores, String primeCores,
++            String littleMin, String bigMin, String primeMin,
++            String littleMax, String bigMax, String primeMax,
++            String allCores
++    ) {}
++
++    private CpuData initCpuProps() {
++        int cpuCount = Runtime.getRuntime().availableProcessors();
++        if (cpuCount <= 0) return emptyData();
++
++        int[] maxFreqs = new int[cpuCount];
++        for (int i = 0; i < cpuCount; i++) {
++            String path = CPU_SYS_PATH + i + SCALING_MAX_FREQ_FILE;
++            maxFreqs[i] = readFreq(path);
++        }
++
++        int minFreq = Integer.MAX_VALUE, maxFreq = Integer.MIN_VALUE;
++        for (int f : maxFreqs) {
++            if (f > 0) {
++                if (f < minFreq) minFreq = f;
++                if (f > maxFreq) maxFreq = f;
++            }
++        }
++
++        int midFreq = -1;
++        for (int f : maxFreqs) {
++            if (f > minFreq && f < maxFreq) {
++                midFreq = f;
++                break;
++            }
++        }
++
++        StringBuilder small = new StringBuilder();
++        StringBuilder big = new StringBuilder();
++        StringBuilder prime = new StringBuilder();
++
++        for (int i = 0; i < cpuCount; i++) {
++            int f = maxFreqs[i];
++            if (f == minFreq) {
++                appendCpu(small, i);
++            } else if (midFreq != -1 && f == midFreq) {
++                appendCpu(big, i);
++            } else if (f == maxFreq) {
++                appendCpu(prime, i);
++            }
++        }
++
++        if (prime.length() == 0) {
++            if (big.length() > 0) {
++                prime.append(big);
++            } else {
++                prime.append(small);
++            }
++        }
++
++        String smallCores = small.toString();
++        String bigCores = big.toString();
++        String primeCores = prime.toString();
++        String allCores = "0-" + String.valueOf(cpuCount -1);
++
++        SystemProperties.set(AX_PROP + "cpu_small", smallCores);
++        SystemProperties.set(AX_PROP + "cpu_big", bigCores);
++        SystemProperties.set(AX_PROP + "cpu_prime", primeCores);
++
++        SystemProperties.set(AX_PROP + "cpu_small_index", firstIndex(smallCores));
++        SystemProperties.set(AX_PROP + "cpu_big_index", firstIndex(bigCores));
++        SystemProperties.set(AX_PROP + "cpu_prime_index", firstIndex(primeCores));
++        
++        SystemProperties.set(AX_PROP + "cpu_all", allCores);
++
++        String value = minFreq + "," + (midFreq > 0 ? midFreq : maxFreq) + "," + maxFreq;
++        SystemProperties.set("persist.sys.ax_max_cpu_freqs", value);
++
++        String littleMin = CPU_SYS_PATH + firstIndex(smallCores) + SCALING_MIN_FREQ_FILE;
++        String bigMin = CPU_SYS_PATH + firstIndex(bigCores) + SCALING_MIN_FREQ_FILE;
++        String primeMin = CPU_SYS_PATH + firstIndex(primeCores) + SCALING_MIN_FREQ_FILE;
++
++        String littleMax = CPU_SYS_PATH + firstIndex(smallCores) + SCALING_MAX_FREQ_FILE;
++        String bigMax = CPU_SYS_PATH + firstIndex(bigCores) + SCALING_MAX_FREQ_FILE;
++        String primeMax = CPU_SYS_PATH + firstIndex(primeCores) + SCALING_MAX_FREQ_FILE;
++
++        String[] bg = smallCores.split(",");
++        String cpuBg = rangeTo(bg, 3);
++        SystemProperties.set(AX_PROP + "cpu_bg", cpuBg);
++
++        String cpuSysBg = toRange(smallCores);
++        SystemProperties.set(AX_PROP + "cpu_sys_bg", cpuSysBg);
++
++        String cpuLimitBg = rangeTo(bg, 2);
++        SystemProperties.set(AX_PROP + "cpu_limit_bg", cpuLimitBg);
++
++        SystemProperties.set(AX_PROP + "cpu_fg", allCores);
++
++        String cpuLimitUi = toRange(smallCores);
++        SystemProperties.set(AX_PROP + "cpu_limit_ui", cpuLimitUi);
++
++        String displayCores = joinRanges(toRange(smallCores), toRange(bigCores));
++        SystemProperties.set(AX_PROP + "cpu_display", displayCores);
++
++        logger("initCpuProps: small=" + smallCores +
++                " big=" + bigCores +
++                " prime=" + primeCores +
++                " freqs=" + value + " allCores=" + allCores);
++
++        return new CpuData(
++                toRange(smallCores), 
++                toRange(bigCores), 
++                toRange(primeCores),
++                littleMin, bigMin, primeMin,
++                littleMax, bigMax, primeMax, 
++                allCores);
++    }
++
++    private CpuData emptyData() {
++        return new CpuData("", "", "",
++                "", "", "",
++                "", "", "", "");
++    }
++
++    private static String rangeTo(String[] cores, int count) {
++        if (cores.length == 0) return "";
++        int limit = Math.min(count, cores.length);
++        if (limit == 1) return cores[0];
++        return cores[0] + "-" + cores[limit - 1];
++    }
++
++    private static String joinRanges(String a, String b) {
++        if (a.isEmpty()) return b;
++        if (b.isEmpty()) return a;
++        return a + "," + b;
++    }
++
++    private static String toRange(String cores) {
++        if (cores == null || cores.isEmpty()) return "";
++        String[] parts = cores.split(",");
++        if (parts.length == 1) return parts[0];
++
++        int start = Integer.parseInt(parts[0]);
++        int prev = start;
++        StringBuilder sb = new StringBuilder();
++        boolean inRange = false;
++
++        for (int i = 1; i < parts.length; i++) {
++            int curr = Integer.parseInt(parts[i]);
++            if (curr == prev + 1) {
++                inRange = true;
++            } else {
++                if (inRange) {
++                    sb.append(start).append("-").append(prev).append(",");
++                } else {
++                    sb.append(start).append(",");
++                }
++                start = curr;
++                inRange = false;
++            }
++            prev = curr;
++        }
++
++        if (inRange) {
++            sb.append(start).append("-").append(prev);
++        } else {
++            sb.append(start);
++        }
++
++        return sb.toString();
++    }
++
++    private static void appendCpu(StringBuilder sb, int idx) {
++        if (sb.length() > 0) sb.append(",");
++        sb.append(idx);
++    }
++
++    private static String firstIndex(String cores) {
++        if (cores == null || cores.isEmpty()) return "0";
++        return cores.split(",")[0];
++    }
++
++    public static String cpuPath(String cgroup) {
++        return "/dev/cpuset/" + cgroup + "/cpus";
++    }
++
++    private static String cpuCtlPath(String cgroup, String file) {
++        return "/dev/cpuctl/" + cgroup + file;
++    }
++
++    private static String prop(String key, String def) {
++        return SystemProperties.get(AX_PROP + key, def);
++    }
++
++    public void writeInternal(String path, String value) {
++        String current = readFile(path);
++        if (current != null && current.equals(value)) {
++            return;
++        }
++        try {
++            FileUtils.stringToFile(path, value);
++            logger("writeInternal write: " + path + " value: " + value);
++        } catch (Exception e) {
++            logger("writeInternal failed: " + path + " : " + e.getMessage());
++        }
++    }
++
++    private static int readFreq(String path) {
++        String val = readFile(path);
++        if (val == null) return -1;
++        try {
++            return Integer.parseInt(val.trim());
++        } catch (NumberFormatException e) {
++            return -1;
++        }
++    }
++
++    private static String readFile(String path) {
++        try {
++            return new String(Files.readAllBytes(Paths.get(path))).trim();
++        } catch (IOException e) {
++            return null;
++        }
++    }
++
++    private static void logger(String msg) {
++        if (SystemProperties.getBoolean("persist.sys.ax_boost_debug", false)) {
++            Slog.d(TAG, msg);
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/am/MemoryManager.java b/services/core/java/com/android/server/am/MemoryManager.java
+new file mode 100644
+index 000000000000..ed0195ee9602
+--- /dev/null
++++ b/services/core/java/com/android/server/am/MemoryManager.java
+@@ -0,0 +1,107 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.server.am;
++
++import android.graphics.Point;
++import android.os.Process;
++import android.os.SystemProperties;
++
++import com.android.server.wm.WindowManagerService;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++
++public class MemoryManager {
++    private final ActivityManagerService mAm;
++    private final WindowManagerService mWindowManager;
++
++    public MemoryManager(ActivityManagerService am) {
++        this.mAm = am;
++        this.mWindowManager = am.mWindowManager;
++    }
++
++    public void releaseMemory(int minAdj, int maxKillCount, boolean includeUIProcesses, boolean skipCamera) {
++        if (minAdj == 0) return;
++
++        try {
++            ArrayList<ProcessRecord> processList =
++                    (ArrayList<ProcessRecord>) mAm.mProcessList.getLruProcessesLOSP().clone();
++
++            ArrayList<ProcessToKill> toKill = new ArrayList<>();
++
++            for (ProcessRecord record : processList) {
++                if (record != null && record.getSetAdj() >= minAdj) {
++                    boolean hasUI = record.hasActivities();
++                    if ((!hasUI || includeUIProcesses) && !shouldSkip(record, skipCamera)) {
++                        toKill.add(new ProcessToKill(record));
++                    }
++                }
++            }
++
++            Collections.sort(toKill, new ProcessComparator());
++
++            int killedCount = 0;
++            for (ProcessToKill info : toKill) {
++                Process.killProcess(info.pid);
++                killedCount++;
++                if (killedCount >= maxKillCount) return;
++            }
++
++        } catch (Exception e) {
++        }
++    }
++
++    public void updateExtraFree() {
++        if (mWindowManager != null) {
++            Point displaySize = new Point();
++            mWindowManager.getBaseDisplaySize(0, displaySize);
++            int extraFreeFactor = 6; // calculated from n2a with 61279 efk = factor ≈ 61279 / (((1080*2412)*4)/1024) ≈ 6.02
++            int extraFreeKb = (((displaySize.x * displaySize.y) * 4) * extraFreeFactor) / 1024;
++            SystemProperties.set("sys.sysctl.extra_free_kbytes", Integer.toString(extraFreeKb));
++        }
++    }
++
++    private boolean shouldSkip(ProcessRecord record, boolean skipCamera) {
++        if (skipCamera && record.processName != null && record.processName.contains("camera")) {
++            return true;
++        }
++        return false;
++    }
++
++    private static class ProcessComparator implements Comparator<ProcessToKill> {
++        @Override
++        public int compare(ProcessToKill p1, ProcessToKill p2) {
++            return Integer.compare(p2.adj, p1.adj);
++        }
++    }
++
++    private static final class ProcessToKill {
++        final int adj;
++        final String name;
++        final int pid;
++        final int uid;
++        final ProcessRecord record;
++
++        ProcessToKill(ProcessRecord record) {
++            this.pid = record.getPid();
++            this.uid = record.uid;
++            this.adj = record.getSetAdj();
++            this.name = record.processName;
++            this.record = record;
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/am/OomAdjuster.java b/services/core/java/com/android/server/am/OomAdjuster.java
+index c77cb376a1c4..dd2e3ca856ff 100644
+--- a/services/core/java/com/android/server/am/OomAdjuster.java
++++ b/services/core/java/com/android/server/am/OomAdjuster.java
+@@ -545,7 +545,17 @@ public class OomAdjuster {
+                     + processName + " to " + group);
+         }
+         try {
+-            android.os.Process.setProcessGroup(pid, group);
++            if (BoostAdjuster.isInPerfList(processName)) {
++                Slog.d(TAG, "set group = " + group);
++            }
++            if (BoostAdjuster.isInPerfList(processName) && !BoostAdjuster.isCamera(processName) 
++                || BoostAdjuster.isCamera(processName) && (group == THREAD_GROUP_TOP_APP 
++                    || group == THREAD_GROUP_RESTRICTED)) {
++                Slog.d(TAG, pid + ": target set cpuset: " + group);
++                Process.setProcessGroup(pid, THREAD_GROUP_RESTRICTED);
++            } else {
++                Process.setProcessGroup(pid, group);
++            }
+         } catch (Exception e) {
+             if (DEBUG_ALL) {
+                 Slog.w(TAG, "Failed setting process group of " + pid + " to " + group, e);
+@@ -3657,13 +3667,21 @@ public class OomAdjuster {
+                     processGroup = THREAD_GROUP_TOP_APP;
+                     break;
+                 case SCHED_GROUP_RESTRICTED:
+-                    processGroup = THREAD_GROUP_RESTRICTED;
++                    if (BoostAdjuster.isRestrictedNeedSelfControll(app)) {
++                        processGroup = BoostAdjuster.THREAD_GROUP_NT_FOREGROUND;
++                    } else {
++                        processGroup = THREAD_GROUP_RESTRICTED;
++                    }
+                     break;
+                 case SCHED_GROUP_FOREGROUND_WINDOW:
+                     processGroup = THREAD_GROUP_FOREGROUND_WINDOW;
+                     break;
+                 default:
+-                    processGroup = THREAD_GROUP_DEFAULT;
++                    if (BoostAdjuster.isForegroundNeedSelfControll(oldSchedGroup, app)) {
++                        processGroup = BoostAdjuster.THREAD_GROUP_NT_FOREGROUND;
++                    } else {
++                        processGroup = THREAD_GROUP_DEFAULT;
++                    }
+                     break;
+             }
+             setAppAndChildProcessGroup(app, processGroup);
+diff --git a/services/core/java/com/android/server/am/ProcessList.java b/services/core/java/com/android/server/am/ProcessList.java
+index ad47e67b9332..040b793fafee 100644
+--- a/services/core/java/com/android/server/am/ProcessList.java
++++ b/services/core/java/com/android/server/am/ProcessList.java
+@@ -102,6 +102,7 @@ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.DropBoxManager;
+ import android.os.Handler;
++import android.os.HandlerThread;
+ import android.os.IBinder;
+ import android.os.Looper;
+ import android.os.Message;
+@@ -398,6 +399,9 @@ public final class ProcessList {
+     static KillHandler sKillHandler = null;
+     static ServiceThread sKillThread = null;
+ 
++    static Handler sHandler = null;
++    static HandlerThread sHandlerThread = null;
++
+     // These are the various interesting memory levels that we will give to
+     // the OOM killer.  Note that the OOM killer only supports 6 slots, so we
+     // can't give it a different value for every possible kind of process.
+@@ -894,6 +898,12 @@ public final class ProcessList {
+         mAppDataIsolationAllowlistedApps = new ArrayList<>(
+                 SystemConfig.getInstance().getAppDataIsolationWhitelistedApps());
+ 
++        if (sHandler == null) {
++            sHandlerThread = new HandlerThread("nt_fore", -2);
++            sHandlerThread.start();
++            sHandler = new Handler(sHandlerThread.getLooper());
++        }
++
+         if (sKillHandler == null) {
+             sKillThread = new ServiceThread(TAG + ":kill",
+                     THREAD_PRIORITY_BACKGROUND, true /* allowIo */);
+@@ -2575,6 +2585,19 @@ public final class ProcessList {
+                         new String[]{PROC_START_SEQ_IDENT + app.getStartSeq()});
+                 // By now the process group should have been created by zygote.
+                 app.mProcessGroupCreated = true;
++                if (startResult.pid > 0 && app.getHostingRecord() != null && !app.getHostingRecord().isTopApp()) {
++                    sHandler.postDelayed(() -> {
++                        try {
++                            if (app.uid % 100000 > 10000 && !BoostAdjuster.isInWhiteList(app.processName) 
++                                    && !BoostAdjuster.isInPerfList(app.processName)) {
++                                Process.setProcessGroup(startResult.pid, BoostAdjuster.THREAD_GROUP_NT_FOREGROUND);
++                            } else if (BoostAdjuster.isInPerfList(app.processName)) {
++                                Process.setProcessGroup(startResult.pid, BoostAdjuster.THREAD_GROUP_RESTRICTED);
++                            }
++                        } catch (Exception e) {
++                        }
++                    }, 50L);
++                }
+             }
+ 
+             if (android.app.Flags.appStartInfoTimestamps()) {
+diff --git a/services/core/java/com/android/server/am/ProcessManager.java b/services/core/java/com/android/server/am/ProcessManager.java
+new file mode 100644
+index 000000000000..9cfd9513932b
+--- /dev/null
++++ b/services/core/java/com/android/server/am/ProcessManager.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.server.am;
++
++import android.content.Context;
++import android.os.Handler;
++import android.os.HandlerThread;
++import android.os.IThermalEventListener;
++import android.os.IThermalService;
++import android.os.ServiceManager;
++import android.os.SystemProperties;
++import android.os.Temperature;
++import android.util.Slog;
++
++public class ProcessManager {
++
++    private static final String TAG = "ProcessManager";
++
++    private ActivityManagerService mActivityManagerService;
++    private Context mContext;
++    private HandlerThread mHandlerThread;
++    private Handler mHandler;
++
++    private static final long MEMORY_RELEASE_INTERVAL_MS = 2 * 60 * 1000L;
++    private long mLastReleaseTime = 0;
++
++    private IThermalService mThermalService;
++    private final IThermalEventListener mThermalListener = new IThermalEventListener.Stub() {
++        @Override
++        public void notifyThrottling(Temperature temperature) {
++            int status = temperature.getStatus();
++            logger("Thermal event: " + temperature + " (status=" + status + ")");
++            if (status != Temperature.THROTTLING_NONE) {
++                releaseMemory();
++            } else {
++                logger("Throttling ended, no mitigation");
++            }
++        }
++    };
++
++    public ProcessManager() {
++    }
++
++    private void initHandlerThread() {
++        mHandlerThread = new HandlerThread("ProcessManager");
++        mHandlerThread.start();
++        mHandler = new Handler(mHandlerThread.getLooper());
++    }
++
++    private void registerThermalCallback() {
++        mThermalService = IThermalService.Stub.asInterface(
++                ServiceManager.getService(Context.THERMAL_SERVICE));
++
++        if (mThermalService == null) {
++            logger("IThermalService not available");
++            return;
++        }
++
++        try {
++            mThermalService.registerThermalEventListener(mThermalListener);
++            logger("Thermal listener registered");
++        } catch (Exception e) {
++            Slog.e(TAG, "Failed to register thermal listener", e);
++        }
++    }
++
++    private void releaseMemory() {
++        long now = System.currentTimeMillis();
++        if (now - mLastReleaseTime < MEMORY_RELEASE_INTERVAL_MS) {
++            return;
++        }
++        mLastReleaseTime = now;
++        logger("Performing thermal mitigation: releasing memory");
++        mActivityManagerService.releaseMemory(900, 20, false, false);
++    }
++
++    public void systemReady(ActivityManagerService ams, Context context) {
++        logger("ProcessManager enabled");
++        mActivityManagerService = ams;
++        mContext = context;
++        initHandlerThread();
++        registerThermalCallback();
++    }
++
++    private void logger(String msg) {
++        if (SystemProperties.getBoolean("persist.sys.ax_thermal_debug", false)) Slog.d(TAG, msg);
++    }
++}
+diff --git a/services/core/java/com/android/server/am/ProcessRecord.java b/services/core/java/com/android/server/am/ProcessRecord.java
+index 400c699bf93f..61ca246457bc 100644
+--- a/services/core/java/com/android/server/am/ProcessRecord.java
++++ b/services/core/java/com/android/server/am/ProcessRecord.java
+@@ -1315,6 +1315,11 @@ class ProcessRecord implements WindowProcessListener {
+                     mKillTime = SystemClock.uptimeMillis();
+                 }
+             }
++            if (!mService.mForceStopKill && !mErrorState.isNotResponding()
++                && !mErrorState.isCrashing()) {
++            } else {
++                mService.mForceStopKill = false;
++            }
+             Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+         }
+     }
+diff --git a/services/core/java/com/android/server/am/TaskProfiler.java b/services/core/java/com/android/server/am/TaskProfiler.java
+new file mode 100644
+index 000000000000..a021f04483d1
+--- /dev/null
++++ b/services/core/java/com/android/server/am/TaskProfiler.java
+@@ -0,0 +1,77 @@
++/*
++ * Copyright (C) 2025 AxionOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.server.am;
++
++import android.os.Process;
++import android.util.Slog;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.Arrays;
++
++public class TaskProfiler {
++    private static final String TAG = "TaskProfiler";
++
++    public TaskProfiler() {
++    }
++
++    public void initTaskProfiles() {
++        String[] bgProfiles = { "ProcessCapacityLow" };
++        String[] bgProcs = { "kswapd", "kcompactd" };
++        setTaskProfilesForProcs(bgProcs, bgProfiles);
++    }
++
++    public static void setTaskProfilesForProcs(String[] procGroups, String[] profiles) {
++        File procDir = new File("/proc");
++        File[] entries = procDir.listFiles(file -> file.isDirectory() && file.getName().matches("\\d+"));
++        if (entries == null) {
++            Slog.w(TAG, "/proc not accessible or empty.");
++            return;
++        }
++
++        for (File pidDir : entries) {
++            File commFile = new File(pidDir, "comm");
++            String processName = null;
++
++            try (BufferedReader reader = new BufferedReader(new FileReader(commFile))) {
++                processName = reader.readLine();
++            } catch (IOException e) {
++                Slog.w(TAG, "Could not read " + commFile.getPath() + ": " + e);
++                continue;
++            }
++
++            if (processName == null) continue;
++
++            for (String proc : procGroups) {
++                if (processName.contains(proc)) {
++                    try {
++                        int pid = Integer.parseInt(pidDir.getName());
++                        Process.setTaskProfiles(pid, profiles);
++                        Slog.i(TAG, "Applied profiles " + Arrays.toString(profiles) +
++                                " to process " + processName + " (PID " + pid + ")");
++                    } catch (NumberFormatException e) {
++                        Slog.w(TAG, "Invalid PID: " + pidDir.getName());
++                    } catch (Exception e) {
++                        Slog.w(TAG, "Failed to set profiles for PID " + pidDir.getName() + ": " + e);
++                    }
++                    break;
++                }
++            }
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/audio/AudioService.java b/services/core/java/com/android/server/audio/AudioService.java
+index f6ab2cc37362..70eef084ceeb 100644
+--- a/services/core/java/com/android/server/audio/AudioService.java
++++ b/services/core/java/com/android/server/audio/AudioService.java
+@@ -6697,6 +6697,7 @@ public class AudioService extends IAudioService.Stub
+                         Log.w(TAG, "setMode link does not exist ...");
+                     }
+                 }
++                SystemProperties.set("dalvik.vm.dex2oat-threads", "2");
+             } else {
+                 if (currentModeHandler != null) {
+                     currentModeHandler.setMode(mode);
+@@ -6719,6 +6720,9 @@ public class AudioService extends IAudioService.Stub
+                         Log.v(TAG, "setMode(" + mode + ") adding handler for pid=" + pid);
+                     }
+                 }
++                if (mode == 1) {
++                    SystemProperties.set("dalvik.vm.dex2oat-threads", "1");
++                }
+                 if (mode == AudioSystem.MODE_IN_COMMUNICATION) {
+                     // Force active state when entering/updating the stack to avoid glitches when
+                     // an app starts playing/recording after settng the audio mode,
+diff --git a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+index 2c90e1919123..01d618cf31c7 100644
+--- a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
++++ b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+@@ -1807,10 +1807,17 @@ public class DisplayModeDirector {
+                     @Override
+                     public void notifyThrottling(Temperature temp) {
+                         @Temperature.ThrottlingStatus int currentStatus = temp.getStatus();
++                        Vote vote;
+                         synchronized (mLock) {
+                             if (mThermalStatus != currentStatus) {
+                                 mThermalStatus = currentStatus;
+                             }
++                            if (mThermalStatus != Temperature.THROTTLING_NONE) {
++                                vote = Vote.forRenderFrameRates(0.0f, 60.0f);
++                            } else {
++                                vote = null;
++                            }
++                            mVotesStorage.updateGlobalVote(Vote.PRIORITY_LOW_POWER_MODE_MODES, vote);
+                             onBrightnessChangedLocked();
+                         }
+                     }
+diff --git a/services/core/java/com/android/server/wm/ActivityRecord.java b/services/core/java/com/android/server/wm/ActivityRecord.java
+index 4b3891da79ed..46d1c22e99b9 100644
+--- a/services/core/java/com/android/server/wm/ActivityRecord.java
++++ b/services/core/java/com/android/server/wm/ActivityRecord.java
+@@ -6224,6 +6224,7 @@ final class ActivityRecord extends WindowToken {
+ 
+         // Schedule an idle timeout in case the app doesn't do it for us.
+         mTaskSupervisor.scheduleIdleTimeout(this);
++        mTaskSupervisor.reportResumedActivityLocked(this);
+ 
+         mTaskSupervisor.mStoppingActivities.remove(this);
+         if (getDisplayArea().allResumedActivitiesComplete()) {
+diff --git a/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java b/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java
+index 82277eaa940d..7b7f23a3d674 100644
+--- a/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java
++++ b/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java
+@@ -2145,6 +2145,17 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
+         }
+     }
+ 
++    boolean reportResumedActivityLocked(ActivityRecord r) {
++        this.mStoppingActivities.remove(r);
++        Task rootTask = r.getRootTask();
++        if (rootTask.getDisplayArea().allResumedActivitiesComplete()) {
++            this.mRootWindowContainer.ensureActivitiesVisible();
++            this.mRootWindowContainer.executeAppTransitionForAllDisplay();
++            return true;
++        }
++        return false;
++    }
++
+     // Called when WindowManager has finished animating the launchingBehind activity to the back.
+     private void handleLaunchTaskBehindCompleteLocked(ActivityRecord r) {
+         final Task task = r.getTask();
+diff --git a/services/core/java/com/android/server/wm/DisplayContent.java b/services/core/java/com/android/server/wm/DisplayContent.java
+index 203daeacc4fe..45b20cb716be 100644
+--- a/services/core/java/com/android/server/wm/DisplayContent.java
++++ b/services/core/java/com/android/server/wm/DisplayContent.java
+@@ -253,6 +253,7 @@ import com.android.internal.util.function.pooled.PooledLambda;
+ import com.android.internal.util.function.pooled.PooledPredicate;
+ import com.android.server.inputmethod.InputMethodManagerInternal;
+ import com.android.server.policy.WindowManagerPolicy;
++import com.android.server.am.BoostAdjuster;
+ import com.android.server.wm.utils.RegionUtils;
+ import com.android.server.wm.utils.RotationCache;
+ import com.android.server.wm.utils.WmDisplayCutout;
+@@ -584,7 +585,9 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+      * new task the user wants to interact with.
+      */
+     ActivityRecord mFocusedApp = null;
+-
++    
++    boolean mBoostingCamera = false;
++    
+     /**
+      * We only respect the orientation request from apps below this {@link TaskDisplayArea}.
+      * It is the last focused {@link TaskDisplayArea} on this display that handles orientation
+@@ -4044,6 +4047,19 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+                 newFocus, getDisplayId(), Debug.getCallers(4));
+         final Task oldTask = mFocusedApp != null ? mFocusedApp.getTask() : null;
+         final Task newTask = newFocus != null ? newFocus.getTask() : null;
++
++        boolean isCamera = newFocus != null
++                && newFocus.packageName != null
++                && BoostAdjuster.CAMERA_APPS.contains(newFocus.packageName);
++
++        if (isCamera && !mBoostingCamera && !BoostAdjuster.isBoosted()) {
++            BoostAdjuster.boostCamera(true);
++            mBoostingCamera = true;
++        } else if (!isCamera && mBoostingCamera) {
++            BoostAdjuster.boostCamera(false);
++            mBoostingCamera = false;
++        }
++
+         mFocusedApp = newFocus;
+         if (oldTask != newTask) {
+             if (oldTask != null) oldTask.onAppFocusChanged(false);
+diff --git a/services/core/java/com/android/server/wm/DisplayPolicy.java b/services/core/java/com/android/server/wm/DisplayPolicy.java
+index 9adfd2724660..08e03e721532 100644
+--- a/services/core/java/com/android/server/wm/DisplayPolicy.java
++++ b/services/core/java/com/android/server/wm/DisplayPolicy.java
+@@ -134,6 +134,7 @@ import com.android.internal.policy.GestureNavigationSettingsObserver;
+ import com.android.internal.policy.ScreenDecorationsUtils;
+ import com.android.internal.protolog.ProtoLog;
+ import com.android.internal.statusbar.LetterboxDetails;
++import com.android.internal.util.BoostHelper;
+ import com.android.internal.util.ScreenshotHelper;
+ import com.android.internal.util.ScreenshotRequest;
+ import com.android.internal.util.function.TriFunction;
+@@ -529,25 +530,21 @@ public class DisplayPolicy {
+                     excludedRegion.recycle();
+                 }
+ 
+-                private void setPerformancePowerMode(boolean enabled) {
+-                    try {
+-                        // systemui is boosting animation abort
+-                        if (!enabled && ActivityManager.getService().isBoostingAnimation()){
+-                            return;
+-                        }
+-                        ActivityManager.getService().setPerformanceMode(enabled);
+-                    } catch (Exception e) {
+-                    }
++                @Override
++                public void onVerticalFling(int duration) {
++                    BoostHelper.boostHint("scroll_fling", duration);
+                 }
+ 
+                 @Override
+                 public void onFling(int duration) {
+-                    setPerformancePowerMode(true);
++                    if (mService.mPowerManagerInternal != null) {
++                        mService.mPowerManagerInternal.setPowerBoost(
++                                Boost.INTERACTION, duration);
++                    }
+                 }
+ 
+                 @Override
+-                public void onFlingEnd() {
+-                    setPerformancePowerMode(false);
++                public void onScroll(boolean started) {
+                 }
+ 
+                 @Override
+diff --git a/services/core/java/com/android/server/wm/PointerEventDispatcher.java b/services/core/java/com/android/server/wm/PointerEventDispatcher.java
+index be259ec3f7c0..7947f81e03d2 100644
+--- a/services/core/java/com/android/server/wm/PointerEventDispatcher.java
++++ b/services/core/java/com/android/server/wm/PointerEventDispatcher.java
+@@ -22,6 +22,7 @@ import android.view.InputEvent;
+ import android.view.InputEventReceiver;
+ import android.view.MotionEvent;
+ import android.view.WindowManagerPolicyConstants.PointerEventListener;
++import com.android.internal.util.BoostHelper;
+ 
+ import com.android.server.UiThread;
+ 
+@@ -38,6 +39,7 @@ public class PointerEventDispatcher extends InputEventReceiver {
+     @Override
+     public void onInputEvent(InputEvent event) {
+         try {
++            BoostHelper.inputBoost(800L);
+             if (event instanceof MotionEvent
+                     && (event.getSource() & InputDevice.SOURCE_CLASS_POINTER) != 0) {
+                 MotionEvent motionEvent = (MotionEvent) event;
+diff --git a/services/core/java/com/android/server/wm/RootWindowContainer.java b/services/core/java/com/android/server/wm/RootWindowContainer.java
+index b6e09d4a1491..3bcdeaf9df91 100644
+--- a/services/core/java/com/android/server/wm/RootWindowContainer.java
++++ b/services/core/java/com/android/server/wm/RootWindowContainer.java
+@@ -142,6 +142,7 @@ import android.window.WindowContainerToken;
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.app.ResolverActivity;
+ import com.android.internal.protolog.ProtoLog;
++import com.android.internal.util.BoostHelper;
+ import com.android.internal.util.function.pooled.PooledLambda;
+ import com.android.internal.util.function.pooled.PooledPredicate;
+ import com.android.server.LocalServices;
+diff --git a/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java b/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
+index ea7f6ceb7bf4..f674287d740b 100644
+--- a/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
++++ b/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
+@@ -91,6 +91,7 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+     private boolean mMouseHoveringAtRight;
+     private boolean mMouseHoveringAtBottom;
+     private long mLastFlingTime;
++    private boolean mScrollFired;
+ 
+     SystemGesturesPointerEventListener(Context context, Handler handler, Callbacks callbacks) {
+         mContext = checkNull("context", context);
+@@ -184,6 +185,10 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             case MotionEvent.ACTION_DOWN:
+                 mSwipeFireable = true;
+                 mDebugFireable = true;
++                if (mScrollFired) {
++                    mCallbacks.onScroll(false);
++                }
++                mScrollFired = false;
+                 mDownPointers = 0;
+                 captureDown(event, 0);
+                 if (mMouseHoveringAtLeft) {
+@@ -290,6 +295,9 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             case MotionEvent.ACTION_CANCEL:
+                 mSwipeFireable = false;
+                 mDebugFireable = false;
++                if (mScrollFired)
++                    mCallbacks.onScroll(false);
++                mScrollFired = false;
+                 mCallbacks.onUpOrCancel();
+                 break;
+             default:
+@@ -419,7 +427,6 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+     private final class FlingGestureDetector extends GestureDetector.SimpleOnGestureListener {
+ 
+         private OverScroller mOverscroller;
+-        private Runnable mFlingEndRunnable;
+ 
+         FlingGestureDetector() {
+             mOverscroller = new OverScroller(mContext);
+@@ -430,7 +437,6 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             if (!mOverscroller.isFinished()) {
+                 mOverscroller.forceFinished(true);
+             }
+-            onCancelGestures();
+             return true;
+         }
+         @Override
+@@ -448,19 +454,21 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             if (duration > MAX_FLING_TIME_MILLIS) {
+                 duration = MAX_FLING_TIME_MILLIS;
+             }
+-            onCancelGestures();
+-            mCallbacks.onFling(duration);
++            if(Math.abs(velocityY) >= Math.abs(velocityX)) {
++                mCallbacks.onVerticalFling(duration);
++            }
+             mLastFlingTime = now;
+-            mFlingEndRunnable = () -> mCallbacks.onFlingEnd();
+-            mHandler.postDelayed(mFlingEndRunnable, duration + 160);
++            mCallbacks.onFling(duration);
+             return true;
+         }
+-        void onCancelGestures() {
+-            if (mFlingEndRunnable != null) {
+-                mHandler.removeCallbacks(mFlingEndRunnable);
+-                mCallbacks.onFlingEnd();
+-                mFlingEndRunnable = null;
+-            }
++        @Override
++        public boolean onScroll(MotionEvent e1, MotionEvent e2,
++                                   float distanceX, float distanceY) {
++           if (!mScrollFired) {
++               mCallbacks.onScroll(true);
++               mScrollFired = true;
++           }
++           return true;
+         }
+     }
+ 
+@@ -470,7 +478,8 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+         void onSwipeFromRight();
+         void onSwipeFromLeft();
+         void onFling(int durationMs);
+-        void onFlingEnd();
++        void onScroll(boolean started);
++        void onVerticalFling(int durationMs);
+         void onDown();
+         void onUpOrCancel();
+         void onMouseHoverAtLeft();
+diff --git a/services/core/java/com/android/server/wm/TaskFragment.java b/services/core/java/com/android/server/wm/TaskFragment.java
+index 986aaa29be92..6638519d232b 100644
+--- a/services/core/java/com/android/server/wm/TaskFragment.java
++++ b/services/core/java/com/android/server/wm/TaskFragment.java
+@@ -102,6 +102,7 @@ import android.window.TaskFragmentOrganizerToken;
+ 
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.protolog.ProtoLog;
++import com.android.internal.util.BoostHelper;
+ import com.android.internal.util.ToBooleanFunction;
+ import com.android.server.am.HostingRecord;
+ import com.android.server.pm.pkg.AndroidPackage;
+@@ -1600,11 +1601,15 @@ class TaskFragment extends WindowContainer<WindowContainer> {
+                     anim = false;
+                 }
+                 prev.setVisibility(false);
+-            } else if (mTaskSupervisor.mNoAnimActivities.contains(next)) {
++            } else {
++                if (mTaskSupervisor.mNoAnimActivities.contains(next)) {
++                    anim = false;
++                }
++            }
++        } else {
++            if (mTaskSupervisor.mNoAnimActivities.contains(next)) {
+                 anim = false;
+             }
+-        } else if (mTaskSupervisor.mNoAnimActivities.contains(next)) {
+-            anim = false;
+         }
+ 
+         if (anim) {
+-- 
+2.51.2
+

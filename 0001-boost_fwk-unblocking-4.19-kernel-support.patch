@@ -1,0 +1,26 @@
+From 892b4831d7ad7b34cd8e6aa5f303d3560e29141a Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Mon, 10 Nov 2025 18:11:18 +0800
+Subject: [PATCH] [boost_fwk] unblocking 4.19 kernel support
+
+Change-Id: I61bf09c0c857b095b1c351f210d75736f352ab89
+---
+ services/core/java/com/android/server/am/BoostAdjuster.java | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+index 29a1e7a468c5..6fe855fa5a59 100644
+--- a/services/core/java/com/android/server/am/BoostAdjuster.java
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -168,7 +168,7 @@ public class BoostAdjuster implements IBoostAdjuster {
+             String[] parts = kernelVersion.split("\\.");
+             int major = Integer.parseInt(parts[0]);
+             int minor = (parts.length > 1) ? Integer.parseInt(parts[1]) : 0;
+-            return (major > 5) || (major == 5 && minor >= 0);
++            return (major > 4) || (major == 4 && minor >= 19);
+         } catch (Exception e) {
+             return false;
+         }
+-- 
+2.51.2
+

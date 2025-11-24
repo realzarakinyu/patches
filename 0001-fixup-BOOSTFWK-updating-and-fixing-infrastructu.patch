@@ -1,0 +1,263 @@
+From 2feac12a7144b8b6f3292cd90b537a926250cf75 Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Thu, 2 Oct 2025 19:33:55 +0800
+Subject: [PATCH] fixup [BOOSTFWK] updating and fixing code infrastructure
+
+Change-Id: I122a20b4968b5ae17bd6a06227ba9dc73e8a5655
+Signed-off-by: rmp22 <195054967+rmp22@users.noreply.github.com>
+---
+ .../com/android/server/am/BoostAdjuster.java  | 137 +++++++++---------
+ .../server/am/BoostSettingsRepository.java    |  39 ++---
+ 2 files changed, 85 insertions(+), 91 deletions(-)
+
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+index bbeb2531cfa1..26b2889b876b 100644
+--- a/services/core/java/com/android/server/am/BoostAdjuster.java
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -34,7 +34,6 @@ import java.io.File;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+-import java.util.Map;
+ 
+ public class BoostAdjuster implements IBoostAdjuster {
+ 
+@@ -55,29 +54,29 @@ public class BoostAdjuster implements IBoostAdjuster {
+     private static final int MSG_BOOST_HINT = 109;
+     private static final int MSG_GAME_BOOST = 110;
+ 
+-    private static HashMap<String, String> sDefaultsCpu = new HashMap<>();
+-    private static HashMap<String, Integer> sCpuUpdateMessages = new HashMap<>();
+-    private static HashMap<String, HashMap> sCpusetGroups =  new HashMap<>();
+-
+-    private static HashMap<Integer, Object> bgCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> sysBgCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> topAppCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> fgCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> restrictedCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> dex2oatCpusetOverrides = new HashMap<>();
+-    private static HashMap<Integer, Object> ntFgCpusetOverrides = new HashMap<>();
++    private static final HashMap<String, File> sFileCache = new HashMap<>();
++    private static final HashMap<String, Integer> sCpuUpdateMessages = new HashMap<>();
++    private static final HashMap<String, HashMap> sCpusetGroups =  new HashMap<>();
++
++    private static final HashMap<Integer, Object> bgCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> sysBgCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> topAppCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> fgCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> restrictedCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> dex2oatCpusetOverrides = new HashMap<>();
++    private static final HashMap<Integer, Object> ntFgCpusetOverrides = new HashMap<>();
+     
+-    private final HashMap<Integer, Integer> mRestrictedPidMap = new HashMap<>();
+-    private static final Map<String, File> sFileCache = new HashMap<>();
+-    private final Map<String, Long> activeHints = new HashMap<>();
+-
+-    private Map<String, String> sConfig;
+-    private Map<String, String> sBoosts;
+-    private Map<String, String> sMinFreqs;
+-    private Map<String, String> sSfBoostEnabled;
+-    private Map<String, String> sSfBoostDisabled;
+-    private Map<String, String> sRestrictBackgroundOn;
+-    private Map<String, String> sRestrictBackgroundOff;
++    private static final HashMap<Integer, Integer> mRestrictedPidMap = new HashMap<>();
++    private static final HashMap<String, Long> activeHints = new HashMap<>();
++
++    private static final HashMap<String, String> sConfig = new HashMap<>();
++    private static final HashMap<String, String> sBoosts = new HashMap<>();
++    private static final HashMap<String, String> sMinFreqs = new HashMap<>();
++    private static final HashMap<String, String> sSfBoostEnabled = new HashMap<>();
++    private static final HashMap<String, String> sSfBoostDisabled = new HashMap<>();
++    private static final HashMap<String, String> sRestrictBackgroundOn = new HashMap<>();
++    private static final HashMap<String, String> sRestrictBackgroundOff = new HashMap<>();
++    private static final HashMap<String, String> sDefaultsCpu = new HashMap<>();
+     
+     private ProcessList procList;
+     private Context mContext;
+@@ -153,56 +152,50 @@ public class BoostAdjuster implements IBoostAdjuster {
+ 
+     private void updateConfigs(DeviceData.BoostData data) {
+         mData = data;
+-        
++
+         mInputBoost = mData.inputBoost;
+         mCpuBoost = mData.cpuBoost;
+         mSfBoost = mData.sfBoost;
+         mGameGpuBoost = mData.gGpuBoost;
+         mSysGpuBoost = mData.sGpuBoost;
+-        
+-        sConfig = Map.of(
+-                data.sMin, data.uSMin,
+-                data.bMin, data.uBMin,
+-                data.pMin, data.uPMin,
+-                data.sMax, data.uSMax,
+-                data.bMax, data.uBMax,
+-                data.pMax, data.uPMax
+-        );
+-
+-        sBoosts = Map.of(
+-                data.sMin, data.fBoost,
+-                data.bMin, data.bigBoost ? data.fBoostB : data.uBMin,
+-                data.pMin, data.fBoostP
+-        );
+-
+-        sMinFreqs = Map.of(
+-                data.sMin, data.uSMin,
+-                data.bMin, data.uBMin,
+-                data.pMin, data.uPMin
+-        );
+-
+-        sSfBoostEnabled = Map.of(
+-                CPU_DISPLAY, data.allCores,
+-                DISPLAY_UC_MIN, "15",
+-                DISPLAY_UC_MAX, "100"
+-        );
+-
+-        sSfBoostDisabled = Map.of(
+-                CPU_DISPLAY, data.displayCpus,
+-                DISPLAY_UC_MIN, "0",
+-                DISPLAY_UC_MAX, "100"
+-        );
+-
+-        sRestrictBackgroundOn = Map.of(
+-                CPU_BG, data.bgLimit,
+-                CPU_NT_FG, data.bgLimit
+-        );
+-
+-        sRestrictBackgroundOff = Map.of(
+-                CPU_BG, data.bgCpus,
+-                CPU_NT_FG, data.bgCpus
+-        );
+ 
++        sConfig.clear();
++        sConfig.put(data.sMin, data.uSMin);
++        sConfig.put(data.bMin, data.uBMin);
++        sConfig.put(data.pMin, data.uPMin);
++        sConfig.put(data.sMax, data.uSMax);
++        sConfig.put(data.bMax, data.uBMax);
++        sConfig.put(data.pMax, data.uPMax);
++
++        sBoosts.clear();
++        sBoosts.put(data.sMin, data.fBoost);
++        sBoosts.put(data.bMin, data.bigBoost ? data.fBoostB : data.uBMin);
++        sBoosts.put(data.pMin, data.fBoostP);
++
++        sMinFreqs.clear();
++        sMinFreqs.put(data.sMin, data.uSMin);
++        sMinFreqs.put(data.bMin, data.uBMin);
++        sMinFreqs.put(data.pMin, data.uPMin);
++
++        sSfBoostEnabled.clear();
++        sSfBoostEnabled.put(CPU_DISPLAY, data.allCores);
++        sSfBoostEnabled.put(DISPLAY_UC_MIN, "15");
++        sSfBoostEnabled.put(DISPLAY_UC_MAX, "100");
++
++        sSfBoostDisabled.clear();
++        sSfBoostDisabled.put(CPU_DISPLAY, data.displayCpus);
++        sSfBoostDisabled.put(DISPLAY_UC_MIN, "0");
++        sSfBoostDisabled.put(DISPLAY_UC_MAX, "100");
++
++        sRestrictBackgroundOn.clear();
++        sRestrictBackgroundOn.put(CPU_BG, data.bgLimit);
++        sRestrictBackgroundOn.put(CPU_NT_FG, data.bgLimit);
++
++        sRestrictBackgroundOff.clear();
++        sRestrictBackgroundOff.put(CPU_BG, data.bgCpus);
++        sRestrictBackgroundOff.put(CPU_NT_FG, data.bgCpus);
++
++        sDefaultsCpu.clear();
+         sDefaultsCpu.put(CPU_SYS_BG, data.sCores);
+         sDefaultsCpu.put(CPU_BG, data.bgCpus);
+         sDefaultsCpu.put(CPU_TOP_APP, data.allCores);
+@@ -333,8 +326,8 @@ public class BoostAdjuster implements IBoostAdjuster {
+             int threadPriority = Process.getThreadPriority(pid);
+ 
+             if (duration > 0) {
+-                Process.setThreadScheduler(pid, Process.SCHED_RR, 1);
+-                Process.setThreadScheduler(renderTid, Process.SCHED_RR, 1);
++                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
++                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
+                 boostUtil(pid, 1);
+                 boostAnimRes(true);
+                 Message m = mHandler.obtainMessage(pid);
+@@ -345,8 +338,8 @@ public class BoostAdjuster implements IBoostAdjuster {
+             }
+ 
+             if (duration == 0) {
+-                Process.setThreadScheduler(pid, Process.SCHED_RR, 1);
+-                Process.setThreadScheduler(renderTid, Process.SCHED_RR, 1);
++                Process.setThreadScheduler(pid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
++                if (renderTid > 0) Process.setThreadScheduler(renderTid, Process.SCHED_FIFO | Process.SCHED_RESET_ON_FORK, 99);
+                 boostUtil(pid, 1);
+                 boostAnimRes(true);
+                 return;
+@@ -629,7 +622,7 @@ public class BoostAdjuster implements IBoostAdjuster {
+         write(enabled ? sSfBoostEnabled : sSfBoostDisabled);
+     }
+ 
+-    public void write(Map<String, String> values) {
++    public void write(HashMap<String, String> values) {
+         mHandler.post(() -> values.forEach((k, v) -> {
+             if (k != null && v != null) AxUtils.write(k, v);
+         }));
+diff --git a/services/core/java/com/android/server/am/BoostSettingsRepository.java b/services/core/java/com/android/server/am/BoostSettingsRepository.java
+index 0a093a5f8260..bf0f0aa190bd 100644
+--- a/services/core/java/com/android/server/am/BoostSettingsRepository.java
++++ b/services/core/java/com/android/server/am/BoostSettingsRepository.java
+@@ -24,7 +24,7 @@ import android.provider.Settings;
+ 
+ import com.android.server.NtServiceInjector;
+ 
+-import java.util.Map;
++import java.util.HashMap;
+ import java.util.function.Consumer;
+ 
+ public class BoostSettingsRepository {
+@@ -64,24 +64,25 @@ public class BoostSettingsRepository {
+     private static final String GAME_GPU_BOOST = "axion_game_gpu_boost_level";
+     private static final String SYS_GPU_BOOST = "axion_sys_gpu_boost_level";
+ 
+-    private static final Map<String, Number> DEFAULTS = Map.ofEntries(
+-            Map.entry(ACB, 1),
+-            Map.entry(ABCB, 0),
+-            Map.entry(APCB, 0),
+-            Map.entry(ASFB, 1),
+-            Map.entry(ATB, 0),
+-            Map.entry(MIN_FREQ_BOOST, DEF),
+-            Map.entry(MIN_FREQ_BIG_BOOST, DEF),
+-            Map.entry(MIN_FREQ_PRIME_BOOST, DEF),
+-            Map.entry(MIN_FREQ, 0),
+-            Map.entry(MIN_FREQ_BIG, 0),
+-            Map.entry(MIN_FREQ_PRIME, 0),
+-            Map.entry(MAX_FREQ, MAX),
+-            Map.entry(MAX_FREQ_BIG, MAX),
+-            Map.entry(MAX_FREQ_PRIME, MAX),
+-            Map.entry(GAME_GPU_BOOST, 1),
+-            Map.entry(SYS_GPU_BOOST, 1)
+-    );
++    private static final HashMap<String, Number> DEFAULTS = new HashMap<>();
++    static {
++        DEFAULTS.put(ACB, 1);
++        DEFAULTS.put(ABCB, 0);
++        DEFAULTS.put(APCB, 0);
++        DEFAULTS.put(ASFB, 1);
++        DEFAULTS.put(ATB, 0);
++        DEFAULTS.put(MIN_FREQ_BOOST, DEF);
++        DEFAULTS.put(MIN_FREQ_BIG_BOOST, DEF);
++        DEFAULTS.put(MIN_FREQ_PRIME_BOOST, DEF);
++        DEFAULTS.put(MIN_FREQ, 0);
++        DEFAULTS.put(MIN_FREQ_BIG, 0);
++        DEFAULTS.put(MIN_FREQ_PRIME, 0);
++        DEFAULTS.put(MAX_FREQ, MAX);
++        DEFAULTS.put(MAX_FREQ_BIG, MAX);
++        DEFAULTS.put(MAX_FREQ_PRIME, MAX);
++        DEFAULTS.put(GAME_GPU_BOOST, 1);
++        DEFAULTS.put(SYS_GPU_BOOST, 1);
++    }
+ 
+     public DeviceData.BoostData loadDeviceData() {
+         boolean cpuBoost = getInt(ACB) == 1;
+-- 
+2.51.2
+
+

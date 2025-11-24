@@ -1,0 +1,495 @@
+From 2239ffc8a9be582d443631e24c4645c915d26273 Mon Sep 17 00:00:00 2001
+From: rmp22 <195054967+rmp22@users.noreply.github.com>
+Date: Sat, 4 Oct 2025 23:05:35 +0800
+Subject: [PATCH] fixup [BOOSTFWK] updating and fixing code infrastructure
+
+Change-Id: I54b5b6513ff49035344417c7257e41e81a46f3a6
+Signed-off-by: rmp22 <195054967+rmp22@users.noreply.github.com>
+---
+ core/jni/android_util_Process.cpp             |   4 +-
+ .../systemui/util/NTCpuBindController.kt      |   2 +-
+ .../com/android/server/am/BoostAdjuster.java  |  39 +++--
+ .../com/android/server/am/DeviceData.java     |   2 -
+ .../com/android/server/am/IBoostAdjuster.java |   3 +
+ .../server/am/NtMemoryManagerImpl.java        | 142 +++++++++++++-----
+ .../com/android/server/am/ProcessManager.java |   4 -
+ .../com/android/server/am/UxPerformance.java  |   3 +
+ .../server/pm/InstallPackageHelper.java       |   5 +
+ .../server/pm/PackageInstallerSession.java    |   4 +
+ 10 files changed, 154 insertions(+), 54 deletions(-)
+
+diff --git a/core/jni/android_util_Process.cpp b/core/jni/android_util_Process.cpp
+index 801c840f0e60..24382ee1444c 100644
+--- a/core/jni/android_util_Process.cpp
++++ b/core/jni/android_util_Process.cpp
+@@ -453,7 +453,9 @@ void android_os_Process_setThreadAffinity(JNIEnv* env, jobject clazz, int tid, j
+         cpuset_str = android::base::GetProperty("persist.sys.axion_cpu_small", "0,1,2,3");
+         group_name = "small cores";
+     } else if (grp == 0) {
+-        cpuset_str = android::base::GetProperty("persist.sys.axion_cpu_big", "4,5,6,7");
++        std::string big = android::base::GetProperty("persist.sys.axion_cpu_big", "4,5,6,7");
++        std::string prime = android::base::GetProperty("persist.sys.axion_cpu_prime", "");
++        cpuset_str = prime.empty() ? big : big + "," + prime;
+         group_name = "big cores";
+     } else if (grp == 2) {
+         int max_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+diff --git a/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt b/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
+index b0813367e91c..c47ee8d4a37e 100644
+--- a/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
++++ b/packages/SystemUI/src/com/android/systemui/util/NTCpuBindController.kt
+@@ -29,7 +29,7 @@ class NTCpuBindController private constructor() {
+     private var mLimitForegroundAppCpu = false
+     private var mLimitOtherProcessCpu = false
+     
+-    private val pid get() = Process.myUid()
++    private val pid get() = Process.myPid()
+ 
+     fun bindBigCore() {
+         if (mBindStatus == STATUS_BIND_BIG_CORE) {
+diff --git a/services/core/java/com/android/server/am/BoostAdjuster.java b/services/core/java/com/android/server/am/BoostAdjuster.java
+index 26b2889b876b..ee1771c5cc46 100644
+--- a/services/core/java/com/android/server/am/BoostAdjuster.java
++++ b/services/core/java/com/android/server/am/BoostAdjuster.java
+@@ -179,13 +179,9 @@ public class BoostAdjuster implements IBoostAdjuster {
+ 
+         sSfBoostEnabled.clear();
+         sSfBoostEnabled.put(CPU_DISPLAY, data.allCores);
+-        sSfBoostEnabled.put(DISPLAY_UC_MIN, "15");
+-        sSfBoostEnabled.put(DISPLAY_UC_MAX, "100");
+ 
+         sSfBoostDisabled.clear();
+         sSfBoostDisabled.put(CPU_DISPLAY, data.displayCpus);
+-        sSfBoostDisabled.put(DISPLAY_UC_MIN, "0");
+-        sSfBoostDisabled.put(DISPLAY_UC_MAX, "100");
+ 
+         sRestrictBackgroundOn.clear();
+         sRestrictBackgroundOn.put(CPU_BG, data.bgLimit);
+@@ -367,7 +363,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+         adjustCpusetCpus(CPU_NT_FG, mData.uiLimit, 0L);
+         adjustCpusetCpus(CPU_DEX2OAT, mData.bgLimit, 0L);
+         adjustCpusetCpus(CPU_BG, mData.bgLimit, 0L);
+-        SystemProperties.set("dalvik.vm.dex2oat-threads", "1");
+         if (mInputBoost) enablePerformanceMode(true);
+         UiThread.getHandler().postDelayed(inputReset, 800L);
+         isNotLimited = false;
+@@ -375,9 +370,9 @@ public class BoostAdjuster implements IBoostAdjuster {
+ 
+     public void setThreadAffinity(int pid, int affinity) {
+         if (affinity == 0) {
+-            Process.setThreadGroupAndCpuset(pid, 5);
++            Process.setThreadGroupAndCpuset(pid, Process.THREAD_GROUP_TOP_APP);
+         } else {
+-            Process.setThreadGroupAndCpuset(pid, 0);
++            Process.setThreadGroupAndCpuset(pid, Process.THREAD_GROUP_FOREGROUND);
+         }
+         Process.setThreadAffinity(pid, affinity);
+     }
+@@ -396,7 +391,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+             adjustCpusetCpus(CPU_DEX2OAT, mData.allCores, -1L);
+             adjustCpusetCpus(CPU_NT_FG, mData.allCores, -1L);
+             adjustCpusetCpus(CPU_BG, mData.bgCpus, -1L);
+-            SystemProperties.set("dalvik.vm.dex2oat-threads", "3");
+             if (mInputBoost) enablePerformanceMode(false);
+             isNotLimited = true;
+         }
+@@ -524,7 +518,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+             restoreCpuset(CPU_NT_FG, mData.allCores);
+             restoreCpuset(CPU_DEX2OAT, mData.allCores);
+             restoreCpuset(CPU_BG, mData.bgCpus);
+-            SystemProperties.set("dalvik.vm.dex2oat-threads", "3");
+             isNotLimited = true;
+             return;
+         }
+@@ -533,7 +526,6 @@ public class BoostAdjuster implements IBoostAdjuster {
+         adjustCpusetCpus(CPU_NT_FG, mData.uiLimit, 0L);
+         adjustCpusetCpus(CPU_DEX2OAT, mData.bgLimit, 0L);
+         adjustCpusetCpus(CPU_BG, mData.bgLimit, 0L);
+-        SystemProperties.set("dalvik.vm.dex2oat-threads", "1");
+     }
+     
+     public void enablePerformanceMode(boolean enabled) {
+@@ -757,4 +749,31 @@ public class BoostAdjuster implements IBoostAdjuster {
+             mFreezing = false;
+         }
+     }
++    
++    public void boostInstall(boolean boost) {
++        String smallCores = prop("cpu_small", "0,1,2,3");
++        String bigCores = prop("cpu_big", "4,5");
++        String primeCores = prop("cpu_prime", "");
++        String bgCores = prop("cpu_bg", "0-2");
++
++        String allCores = joinRanges(smallCores, bigCores);
++        if (!primeCores.isEmpty()) {
++            allCores = joinRanges(allCores, primeCores);
++        }
++
++        allCores = allCores.replace("-", ",");
++
++        int threadCount = boost ?
++                Runtime.getRuntime().availableProcessors() : 1;
++
++        String cpuSet = boost ? allCores : bgCores.replace("-", ",");
++
++        SystemProperties.set("dalvik.vm.dex2oat-threads", String.valueOf(threadCount));
++        SystemProperties.set("dalvik.vm.restore-dex2oat-threads", String.valueOf(threadCount));
++        SystemProperties.set("dalvik.vm.dex2oat-cpu-set", cpuSet);
++        SystemProperties.set("dalvik.vm.restore-dex2oat-cpu-set", cpuSet);
++
++        logger("boostInstall boost=" + boost +
++                " threads=" + threadCount + " cpuset=" + cpuSet);
++    }
+ }
+diff --git a/services/core/java/com/android/server/am/DeviceData.java b/services/core/java/com/android/server/am/DeviceData.java
+index 67fb6bfd7c0e..9a278e88e8c1 100644
+--- a/services/core/java/com/android/server/am/DeviceData.java
++++ b/services/core/java/com/android/server/am/DeviceData.java
+@@ -47,8 +47,6 @@ public final class DeviceData {
+ 
+     public static final String RESTRICTED_UC_MAX = AxUtils.cpuCtlPath("restricted", "/cpu.uclamp.max");
+     public static final String RESTRICTED_UC_MIN = AxUtils.cpuCtlPath("restricted", "/cpu.uclamp.min");
+-    public static final String DISPLAY_UC_MAX = AxUtils.cpuCtlPath("display", "/cpu.uclamp.max");
+-    public static final String DISPLAY_UC_MIN = AxUtils.cpuCtlPath("display", "/cpu.uclamp.min");
+ 
+     private final CpuData cData;
+     private String[] gpuAvailableFreqs;
+diff --git a/services/core/java/com/android/server/am/IBoostAdjuster.java b/services/core/java/com/android/server/am/IBoostAdjuster.java
+index fd3cb125de1b..b4efa2c29f96 100644
+--- a/services/core/java/com/android/server/am/IBoostAdjuster.java
++++ b/services/core/java/com/android/server/am/IBoostAdjuster.java
+@@ -48,4 +48,7 @@ public interface IBoostAdjuster {
+     
+     default void boostGame(boolean enable) {
+     }
++    
++    default void boostInstall(boolean boost) {
++    }
+ }
+diff --git a/services/core/java/com/android/server/am/NtMemoryManagerImpl.java b/services/core/java/com/android/server/am/NtMemoryManagerImpl.java
+index aed5ea6f317f..9ef2a9a23db5 100644
+--- a/services/core/java/com/android/server/am/NtMemoryManagerImpl.java
++++ b/services/core/java/com/android/server/am/NtMemoryManagerImpl.java
+@@ -35,11 +35,7 @@ import com.android.server.utils.SimpleAppRecord;
+ import java.io.BufferedReader;
+ import java.io.FileReader;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.Comparator;
+-import java.util.Iterator;
+-import org.json.*;
++import java.util.*;
+ 
+ public class NtMemoryManagerImpl implements INtMemoryManager {
+     private static final String TAG = "NtMemoryManagerImpl";
+@@ -102,18 +98,43 @@ public class NtMemoryManagerImpl implements INtMemoryManager {
+     
+     private boolean mSystemReady = false;
+ 
++
+     public static final class ProcessInfo {
+         public int pid;
+         public int adj;
++        public long rss;
+         public String name;
++        public float score;
+ 
+-        public ProcessInfo(int pid, int adj, String name) {
++        public ProcessInfo(int pid, int adj, long rss, String name) {
+             this.pid = pid;
+             this.adj = adj;
++            this.rss = rss;
+             this.name = name;
+         }
+     }
+ 
++    public static final class RssComparator implements Comparator<ProcessInfo> {
++        @Override
++        public int compare(ProcessInfo p1, ProcessInfo p2) {
++            return Long.compare(p2.rss, p1.rss);
++        }
++    }
++
++    public static final class AdjComparator implements Comparator<ProcessInfo> {
++        @Override
++        public int compare(ProcessInfo p1, ProcessInfo p2) {
++            return Integer.compare(p2.adj, p1.adj);
++        }
++    }
++
++    public static final class ScoreComparator implements Comparator<ProcessInfo> {
++        @Override
++        public int compare(ProcessInfo p1, ProcessInfo p2) {
++            return Float.compare(p2.score, p1.score);
++        }
++    }
++
+     class MemoryHandler extends Handler {
+         MemoryHandler(Looper looper) {
+             super(looper);
+@@ -161,13 +182,6 @@ public class NtMemoryManagerImpl implements INtMemoryManager {
+         }
+     }
+ 
+-    public static final class ProcessComparator implements Comparator<ProcessInfo> {
+-        @Override
+-        public int compare(ProcessInfo p1, ProcessInfo p2) {
+-            return Integer.valueOf(p2.adj).compareTo(Integer.valueOf(p1.adj));
+-        }
+-    }
+-
+     public NtMemoryManagerImpl() {
+     }
+ 
+@@ -359,55 +373,102 @@ public class NtMemoryManagerImpl implements INtMemoryManager {
+         AxExtServiceFactory.getAppUsageManager().setTargetAdj(appRecord.mPackageName, targetAdj);
+     }
+ 
+-    public void releaseMemory(int minAdj, int killCount, boolean killWithUi, 
+-                                          boolean skipCamera) {
++    public void releaseMemory(int minAdj, int killCount, boolean killWithUi, boolean skipCamera) {
+         if (killCount == 0) return;
++        
++        List<String> whiteList = List.of("com.google.android.googlequicksearchbox:search", "com.google.android.gms", "com.android.chrome");
+ 
+         try {
+-            @SuppressWarnings("unchecked")
+-            ArrayList<ProcessRecord> lruProcesses = 
+-                (ArrayList<ProcessRecord>) mActivityManagerService.mProcessList.getLruProcessesLOSP().clone();
++            ArrayList<ProcessRecord> lruProcesses =
++                    (ArrayList<ProcessRecord>) mActivityManagerService.mProcessList.getLruProcessesLOSP().clone();
+             ArrayList<ProcessInfo> candidates = new ArrayList<>();
+ 
+             for (ProcessRecord proc : lruProcesses) {
+                 if (proc != null && proc.getSetAdj() >= minAdj) {
+                     if (!proc.hasActivities() || killWithUi) {
+-                        candidates.add(new ProcessInfo(proc.getPid(), proc.getSetAdj(), proc.processName));
++                        if (whiteList == null || !whiteList.contains(proc.processName)) {
++                            candidates.add(new ProcessInfo(
++                                    proc.getPid(),
++                                    proc.getSetAdj(),
++                                    proc.mProfile.getLastRss(),
++                                    proc.processName));
++                        } else if (DEBUG) {
++                            Slog.d(TAG, "Skip killing whitelisted process: " + proc.processName);
++                        }
+                     } else if (DEBUG) {
+                         Slog.d(TAG, "Don't kill process with UI: " + proc.processName);
+                     }
+                 }
+             }
+ 
+-            Collections.sort(candidates, new ProcessComparator());
++            float adjWeight = killWithUi ? 1.0f : (10 % 11 / 10.0f);
++            float rssWeight = 1.0f - adjWeight;
++
++            if (DEBUG) {
++                Slog.d(TAG, "adjWeight=" + adjWeight + ", rssWeight=" + rssWeight);
++            }
++
++            if (rssWeight != 0f) {
++                Collections.sort(candidates, new RssComparator());
++                applyWeight(candidates, rssWeight, 1);
++                if (DEBUG) dumpList("After RSS sort", candidates);
++            }
++
++            if (adjWeight != 0f) {
++                Collections.sort(candidates, new AdjComparator());
++                applyWeight(candidates, adjWeight, 0);
++                if (DEBUG) dumpList("After Adj sort", candidates);
++            }
++
++            Collections.sort(candidates, new ScoreComparator());
++            if (DEBUG) dumpList("After Score sort", candidates);
+ 
+             int killed = 0;
+             for (ProcessInfo candidate : candidates) {
+-                if (!skipCamera || !isCamera(candidate.name)) {
+-                    Process.killProcess(candidate.pid);
+-                    killed++;
+-                    
++                Process.killProcess(candidate.pid);
++                killed++;
++                if (DEBUG) {
++                    Slog.d(TAG, "Killed proc " + candidate.name +
++                            " [pid=" + candidate.pid + "] adj=" + candidate.adj +
++                            " rss=" + candidate.rss + " score=" + candidate.score +
++                            " killed: " + killed);
++                }
++                if (killed >= killCount) {
+                     if (DEBUG) {
+-                        Slog.d(TAG, "Killed proc " + candidate.name + 
+-                               ": adj: " + candidate.adj + 
+-                               " to release memory, now killed: " + killed + " processes");
+-                    }
+-                    
+-                    if (killed >= killCount) {
+-                        if (DEBUG) {
+-                            Slog.d(TAG, "Stop killing processes, killCount: " + killCount);
+-                        }
+-                        return;
++                        Slog.d(TAG, "Stop killing processes, killCount=" + killCount);
+                     }
+-                } else if (DEBUG) {
+-                    Slog.d(TAG, "Skipped killing camera: " + skipCamera + ", " + candidate.name);
++                    return;
+                 }
+             }
++
+         } catch (Exception e) {
+             e.printStackTrace();
+         }
+     }
+ 
++    private void applyWeight(List<ProcessInfo> list, float weight, int mode) {
++        float offset = 0f;
++        for (int i = 0; i < list.size(); i++) {
++            if (i != 0) {
++                long prevVal = (mode == 0) ? list.get(i - 1).adj : list.get(i - 1).rss;
++                long currVal = (mode == 0) ? list.get(i).adj : list.get(i).rss;
++
++                if (currVal != prevVal) {
++                    offset = i * weight;
++                }
++                list.get(i).score += offset;
++            }
++        }
++    }
++
++    private void dumpList(String tag, List<ProcessInfo> list) {
++        for (ProcessInfo p : list) {
++            Slog.d(TAG, tag + " -> " + p.name + " adj=" + p.adj +
++                    " rss=" + p.rss + " score=" + p.score);
++        }
++    }
++
++
+     private ProcessRecord findProcessRecord(String packageName) {
+         synchronized (mActivityManagerService.mProcLock) {
+             int userId = mActivityManagerService.getCurrentUserId();
+@@ -479,6 +540,7 @@ public class NtMemoryManagerImpl implements INtMemoryManager {
+             updateCameraDeviceDatauration();
+             updateReleaseMemoryConfiguration();
+             updateHighUsedOptimizationConfiguration();
++            updateUsapPoolCOnfiguration();
+         } catch (Exception e) {
+             e.printStackTrace();
+         }
+@@ -729,4 +791,12 @@ public class NtMemoryManagerImpl implements INtMemoryManager {
+             }
+         }
+     }
++    
++    private void updateUsapPoolCOnfiguration() {
++        SystemProperties.set("persist.device_config.runtime_native.usap_pool_enabled", "true");
++        SystemProperties.set("persist.device_config.runtime_native.usap_pool_refill_delay_ms", "3000");
++        SystemProperties.set("persist.device_config.runtime_native.usap_refill_threshold", "1");
++        SystemProperties.set("persist.device_config.runtime_native.usap_pool_size_max", "3");
++        SystemProperties.set("persist.device_config.runtime_native.usap_pool_size_min", "1");
++    }
+ }
+diff --git a/services/core/java/com/android/server/am/ProcessManager.java b/services/core/java/com/android/server/am/ProcessManager.java
+index 2a29e8742aa3..f17a470e540f 100644
+--- a/services/core/java/com/android/server/am/ProcessManager.java
++++ b/services/core/java/com/android/server/am/ProcessManager.java
+@@ -214,10 +214,6 @@ public class ProcessManager implements IProcessManager {
+         }
+         synchronized (mPendingStartQueue) {
+             if (mPendingStartQueue.size() > 0) {
+-                logger("Dump NtPendingStart:");
+-                for (ServiceRecord sr : mPendingStartQueue) {
+-                    logger(sr.processName + ": " + sr.name);
+-                }
+                 mHandler.sendMessage(mHandler.obtainMessage(MSG_PROCESS_PENDING));
+             }
+         }
+diff --git a/services/core/java/com/android/server/am/UxPerformance.java b/services/core/java/com/android/server/am/UxPerformance.java
+index 4849e7c26e7f..b1811da217b4 100644
+--- a/services/core/java/com/android/server/am/UxPerformance.java
++++ b/services/core/java/com/android/server/am/UxPerformance.java
+@@ -159,6 +159,7 @@ public class UxPerformance implements IUxPerformance {
+             logger("started PAppsSpeed opt after entering idle mode");
+         } else {
+             pAppsHandler.removeCallbacksAndMessages(null);
++            AxExtServiceFactory.getBoostAdjuster().boostInstall(false);
+             logger("stopped PAppsSpeed opt due to screen event");
+         }
+     }
+@@ -183,6 +184,8 @@ public class UxPerformance implements IUxPerformance {
+                 logger("No preferred apps to optimize");
+                 return;
+             }
++            
++            AxExtServiceFactory.getBoostAdjuster().boostInstall(true);
+ 
+             logger("Running PAppsSpeed opt, total packages=" + pkgSet.size());
+ 
+diff --git a/services/core/java/com/android/server/pm/InstallPackageHelper.java b/services/core/java/com/android/server/pm/InstallPackageHelper.java
+index 1dc1d02e7cc1..d93473686ed2 100644
+--- a/services/core/java/com/android/server/pm/InstallPackageHelper.java
++++ b/services/core/java/com/android/server/pm/InstallPackageHelper.java
+@@ -1699,6 +1699,7 @@ final class InstallPackageHelper {
+                     // on the device; we should replace it.
+                     replace = true;
+                     if (DEBUG_INSTALL) Slog.d(TAG, "Replace existing package: " + pkgName);
++                    AxExtServiceFactory.getBoostAdjuster().boostInstall(true);
+                 }
+                 if (replace) {
+                     // Prevent apps opting out from runtime permissions
+@@ -2299,6 +2300,7 @@ final class InstallPackageHelper {
+                     }
+                 }
+                 AxExtServiceFactory.getAppUsageManager().addNewPackages(pkgName1);
++                AxExtServiceFactory.getBoostAdjuster().boostInstall(true);
+             }
+             // we're passing the freezer back to be closed in a later phase of install
+             shouldCloseFreezerBeforeReturn = false;
+@@ -2615,6 +2617,9 @@ final class InstallPackageHelper {
+                     PackageManagerException.INTERNAL_ERROR_MISSING_USER));
+             return;
+         }
++        if (pkgName != null) {
++            AxExtServiceFactory.getBoostAdjuster().boostInstall(true);
++        }
+         synchronized (mPm.mLock) {
+             // For system-bundled packages, we assume that installing an upgraded version
+             // of the package implies that the user actually wants to run that new code,
+diff --git a/services/core/java/com/android/server/pm/PackageInstallerSession.java b/services/core/java/com/android/server/pm/PackageInstallerSession.java
+index f694dc924c02..a1301c45c91e 100644
+--- a/services/core/java/com/android/server/pm/PackageInstallerSession.java
++++ b/services/core/java/com/android/server/pm/PackageInstallerSession.java
+@@ -190,6 +190,7 @@ import com.android.internal.util.IndentingPrintWriter;
+ import com.android.internal.util.Preconditions;
+ import com.android.modules.utils.TypedXmlPullParser;
+ import com.android.modules.utils.TypedXmlSerializer;
++import com.android.server.AxExtServiceFactory;
+ import com.android.server.IoThread;
+ import com.android.server.LocalServices;
+ import com.android.server.art.ArtManagedInstallFileHelper;
+@@ -1930,6 +1931,7 @@ public class PackageInstallerSession extends IPackageInstallerSession.Stub {
+     public ParcelFileDescriptor openWrite(String name, long offsetBytes, long lengthBytes) {
+         assertCanWrite(false);
+         try {
++            AxExtServiceFactory.getBoostAdjuster().boostInstall(true);
+             return doWriteInternal(name, offsetBytes, lengthBytes, null);
+         } catch (IOException e) {
+             throw ExceptionUtils.wrap(e);
+@@ -2187,6 +2189,7 @@ public class PackageInstallerSession extends IPackageInstallerSession.Stub {
+ 
+     @Override
+     public void commit(@NonNull IntentSender statusReceiver, boolean forTransfer) {
++        AxExtServiceFactory.getBoostAdjuster().boostInstall(false);
+         assertNotChild("commit");
+         boolean throwsExceptionCommitImmutableCheck = CompatChanges.isChangeEnabled(
+                 THROW_EXCEPTION_COMMIT_WITH_IMMUTABLE_PENDING_INTENT, Binder.getCallingUid());
+@@ -4649,6 +4652,7 @@ public class PackageInstallerSession extends IPackageInstallerSession.Stub {
+ 
+     @Override
+     public void abandon() {
++        AxExtServiceFactory.getBoostAdjuster().boostInstall(false);
+         final Runnable r;
+         synchronized (mLock) {
+             assertNotChild("abandon");
+-- 
+2.51.2
+
